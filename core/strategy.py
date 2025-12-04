@@ -200,24 +200,37 @@ class TickScalper:
             self.state = "IDLE" # 下一轮循环重新挂单
 
     def _logic_sell(self, best_bid, best_ask):
-        # 持仓卖出逻辑 (分级止损)
+        # 持仓卖出逻辑 (分级止损 + 最小利润保护)
         
         # 还没有挂卖单，需要决定价格
         if not self.active_order_id:
+            # 确保有成本价，防止除0错误
+            if self.avg_cost == 0:
+                self.avg_cost = best_bid
+                
             duration = time.time() - self.hold_start_time
             pnl_pct = (best_bid - self.avg_cost) / self.avg_cost
             
-            target_price = best_ask # 默认挂卖一
+            # --- 核心修复开始 ---
+            # 计算保本卖出价（成本 + 1个最小跳动点）
+            min_profit_price = self.avg_cost + self.tick_size
+            
+            # 默认目标：取 [市场卖一价] 和 [保本价] 中的较大值
+            # 这样即使市场卖一跌破了成本，我们也会坚持挂在保本价上等待，而不是亏损卖出
+            target_price = max(best_ask, min_profit_price)
             post_only = True
+            # --- 核心修复结束 ---
             
             # 场景A: 价格止损 (Taker)
+            # 如果亏损超过设定比例（如 1%），则认赔离场，直接砸给买一
             if pnl_pct < -self.cfg.STOP_LOSS_PCT:
                 logger.warning(f"🚨 触发价格止损 ({pnl_pct*100:.2f}%) -> Taker")
                 target_price = best_bid
                 post_only = False
             
             # 场景B: 超时止损 (Maker)
-            elif duration > 135: # 135秒超时
+            # 如果持仓时间太久（如 135秒），为了释放资金，允许跟随市场卖一（可能会小亏）
+            elif duration > 135: 
                 logger.warning(f"⏰ 触发超时止损 ({duration:.0f}s) -> Maker")
                 target_price = best_ask
                 
@@ -225,6 +238,10 @@ class TickScalper:
         
         else:
             # 已有卖单，检查是否需要调整
-            # 如果是超时止损模式，随着 Ask 移动
-            if self.active_order_price != best_ask and (time.time() - self.hold_start_time > 135):
-                 self.cancel_all() # 撤单，下一轮重挂
+            # 只有在【超时止损】模式下，我们才允许向下移动挂单去追市场
+            if (time.time() - self.hold_start_time > 135):
+                 # 如果当前挂单价格 不等于 市场卖一，说明市场跑了，我们需要撤单重挂
+                 # 注意：这里加个小阈值判断防止频繁撤单会更好，但为了简化直接判断不等
+                 if abs(self.active_order_price - best_ask) > self.tick_size / 2:
+                    logger.info("超时追单调整...")
+                    self.cancel_all()
