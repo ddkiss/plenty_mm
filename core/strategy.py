@@ -15,8 +15,13 @@ class TickScalper:
         
         # State
         self.state = "IDLE"  # IDLE, BUYING, SELLING
+        
+        # Order Tracking
         self.active_order_id = None
         self.active_order_price = 0.0
+        self.active_order_side = None # 新增：记录当前挂单方向
+        
+        # Position Tracking
         self.held_qty = 0.0
         self.avg_cost = 0.0
         self.hold_start_time = 0
@@ -48,28 +53,24 @@ class TickScalper:
         exit(1)
 
     def get_usdc_balance(self):
-        """获取用于交易的可用余额 (智能识别现货/合约)"""
-        # 1. 合约交易 (PERP): 优先读取可用权益 (Net Equity)
+        """获取用于交易的可用余额"""
+        # 1. 合约交易 (PERP)
         if "PERP" in self.symbol:
             col_res = self.rest.get_collateral()
             if isinstance(col_res, dict):
-                # 优先使用 netEquityAvailable (包含了 lend/borrow 后的实际可用保证金)
                 if "netEquityAvailable" in col_res:
-                    equity = float(col_res["netEquityAvailable"])
-                    # logger.info(f"合约可用权益: {equity}")
-                    return equity
-                    
-                # 回退逻辑：如果找不到 netEquity，尝试累加 USDC 资产
+                    return float(col_res["netEquityAvailable"])
+                
+                # Fallback logic
                 total_col = 0.0
                 assets = col_res.get("collateral", []) or col_res.get("assets", [])
                 for asset in assets:
                     if asset.get("symbol") == "USDC":
-                        # 将 available 和 lend 加总
                         total_col += float(asset.get("availableQuantity", 0))
                         total_col += float(asset.get("lendQuantity", 0))
                 return total_col
 
-        # 2. 现货交易 (Spot): 读取现货钱包
+        # 2. 现货交易 (Spot)
         spot_res = self.rest.get_balance()
         if isinstance(spot_res, dict) and "USDC" in spot_res:
             data = spot_res["USDC"]
@@ -81,59 +82,97 @@ class TickScalper:
         return 0.0
 
     def on_order_update(self, data):
-        """ WebSocket 回调: 处理成交 """
+        """ WebSocket 回调: 核心状态管理 """
         event = data.get('e')
         if event == 'orderFill':
-            side = data.get('S')
-            price = float(data.get('L'))
-            qty = float(data.get('l'))
+            side = data.get('S') # Bid/Ask
+            price = float(data.get('L')) # Fill Price
+            qty = float(data.get('l'))   # Fill Qty
             logger.info(f"⚡ 成交: {side} {qty} @ {price}")
             
+            # --- 买入逻辑 (Bid) ---
             if side == "Bid":
+                # 1. 累加持仓 (防止多次部分成交导致数据覆盖)
+                # 计算加权平均成本 (简化版：如果已有持仓，做加权)
+                if self.held_qty > 0:
+                    total_val = (self.held_qty * self.avg_cost) + (qty * price)
+                    self.held_qty += qty
+                    self.avg_cost = total_val / self.held_qty
+                else:
+                    self.held_qty = qty
+                    self.avg_cost = price
+                    self.hold_start_time = time.time()
+
+                # 2. 状态流转: 只要买到了，就准备卖
                 self.state = "SELLING"
-                self.held_qty = qty
-                self.avg_cost = price
-                self.hold_start_time = time.time()
-                self.active_order_id = None # 买单成交，当前无挂单
-            elif side == "Ask":
-                profit = (price - self.avg_cost) * qty
-                logger.info(f"💰 止盈/损结束 (PnL: {profit:.4f})")
-                if profit < 0:
-                    self.last_cool_down = time.time()
-                    logger.warning(f"🛑 亏损冷却 {self.cfg.COOL_DOWN}s")
                 
-                self.state = "IDLE"
-                self.held_qty = 0
-                self.active_order_id = None
+                # 3. [关键修正] 截断式处理
+                # 如果当前策略认为还在挂买单，说明可能只是部分成交。
+                # 为了防止"幽灵买单"，必须立即撤销剩余的买单！
+                if self.active_order_id and self.active_order_side == 'Bid':
+                    logger.info("部分成交 -> 撤销剩余买单以锁定仓位")
+                    self.cancel_all() # 强制撤单，确保不再买入
+                    # cancel_all 会重置 active_order_id
+
+            # --- 卖出逻辑 (Ask) ---
+            elif side == "Ask":
+                # 1. 扣减持仓
+                self.held_qty -= qty
+                if self.held_qty < 0: self.held_qty = 0 # 防御性归零
+
+                profit = (price - self.avg_cost) * qty
+                logger.info(f"💰 卖出反馈 (PnL: {profit:.4f}) | 剩余持仓: {self.held_qty:.4f}")
+
+                # 2. 判断是否卖完
+                if self.held_qty < self.min_qty:
+                    # 全部卖完了
+                    self.state = "IDLE"
+                    self.active_order_id = None # 清理 ID，允许下一轮买入
+                    self.active_order_side = None
+                    self.held_qty = 0
+                    
+                    if profit < 0:
+                        self.last_cool_down = time.time()
+                        logger.warning(f"🛑 亏损冷却 {self.cfg.COOL_DOWN}s")
+                else:
+                    # 3. [关键修正] 部分卖出
+                    # 还有剩余持仓，说明订单还没跑完。
+                    # *不要* 清除 active_order_id，也不要改状态。
+                    # 让挂在交易所的剩余卖单继续跑。
+                    logger.info(f"⏳ 部分卖出，剩余 {self.held_qty:.4f} 等待成交...")
+                    # 保持 active_order_id 不变，_logic_sell 会看到 ID 存在而不做操作
 
     def cancel_all(self):
-        self.rest.cancel_open_orders(self.symbol)
+        """撤销所有订单并重置跟踪 ID"""
+        if self.active_order_id:
+            try:
+                self.rest.cancel_open_orders(self.symbol)
+            except Exception as e:
+                logger.error(f"撤单失败: {e}")
         self.active_order_id = None
+        self.active_order_side = None
 
     def run(self):
         self.init_market_info()
         self.ws.connect()
         self.running = True
         
-        # 清理旧单
         self.cancel_all()
-        
         logger.info(f"策略启动: {self.symbol} | 余额比例: {self.cfg.BALANCE_PCT} | 止损: {self.cfg.STOP_LOSS_PCT*100}%")
 
         while self.running:
-            time.sleep(0.5) # 控制循环频率
+            time.sleep(0.5)
             
-            # 1. 冷却检查
+            # 1. 冷却
             if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
                 continue
 
-            # 2. 等待行情
+            # 2. 行情
             bid = self.ws.best_bid
             ask = self.ws.best_ask
-            if bid == 0 or ask == 0:
-                continue
+            if bid == 0 or ask == 0: continue
 
-            # 3. 策略状态机
+            # 3. 状态机
             if self.state == "IDLE":
                 self._logic_buy(bid, ask)
             elif self.state == "BUYING":
@@ -146,7 +185,6 @@ class TickScalper:
         qty = floor_to(qty, self.base_precision)
         
         if qty < self.min_qty:
-            # logger.warning(f"数量太小: {qty} < {self.min_qty}")
             return None
 
         order_data = {
@@ -161,6 +199,7 @@ class TickScalper:
         if "id" in res:
             self.active_order_id = res["id"]
             self.active_order_price = price
+            self.active_order_side = side # 记录方向
             logger.info(f"挂单成功 [{side}]: {qty} @ {price}")
             return res["id"]
         else:
@@ -168,80 +207,63 @@ class TickScalper:
             return None
 
     def _logic_buy(self, best_bid, best_ask):
-        # 简单判断：如果当前没有挂单，则挂单
-        if self.active_order_id:
-            return
+        if self.active_order_id: return
 
-        # 获取 USDC 余额 (现在可以正确读取 netEquityAvailable)
         usdc_available = self.get_usdc_balance()
+        if usdc_available <= 0: return
         
-        if usdc_available <= 0:
-            if int(time.time()) % 10 == 0: # 减少日志频率
-                logger.warning(f"可用余额不足 (USDC: {usdc_available})")
-            return
-        
-        # 计算下单量
-        amount_usdc = usdc_available * self.cfg.BALANCE_PCT * self.cfg.LEVERAGE
-        qty = amount_usdc / best_bid
-        
-        # 挂在买一价 (Maker)
+        qty = (usdc_available * self.cfg.BALANCE_PCT * self.cfg.LEVERAGE) / best_bid
         self._place_order("Bid", best_bid, qty, post_only=True)
         self.state = "BUYING"
 
     def _logic_chase_buy(self, best_bid):
-        # 追单逻辑：如果市场买一价超过我的挂单价一定比例，撤单重挂
         if not self.active_order_id: 
-            self.state = "IDLE" # 订单可能被手动取消或失效
+            self.state = "IDLE"
             return
             
-        if best_bid > self.active_order_price * (1 + 0.0001): # 0.01% 阈值
+        if best_bid > self.active_order_price * (1 + 0.0001):
             logger.info(f"🚀 追涨: 市场 {best_bid} > 挂单 {self.active_order_price}")
             self.cancel_all()
-            self.state = "IDLE" # 下一轮循环重新挂单
+            self.state = "IDLE"
 
     def _logic_sell(self, best_bid, best_ask):
-        # 持仓卖出逻辑 (分级止损 + 最小利润保护)
-        
-        # 还没有挂卖单，需要决定价格
+        # 1. 如果没有挂单，则计算价格挂单
         if not self.active_order_id:
-            # 确保有成本价，防止除0错误
-            if self.avg_cost == 0:
-                self.avg_cost = best_bid
-                
+            if self.avg_cost == 0: self.avg_cost = best_bid
+            if self.held_qty < self.min_qty: 
+                self.state = "IDLE"
+                return
+
             duration = time.time() - self.hold_start_time
             pnl_pct = (best_bid - self.avg_cost) / self.avg_cost
             
-            # --- 核心修复开始 ---
-            # 计算保本卖出价（成本 + 1个最小跳动点）
+            # 默认：最小利润保护
             min_profit_price = self.avg_cost + self.tick_size
-            
-            # 默认目标：取 [市场卖一价] 和 [保本价] 中的较大值
-            # 这样即使市场卖一跌破了成本，我们也会坚持挂在保本价上等待，而不是亏损卖出
             target_price = max(best_ask, min_profit_price)
             post_only = True
-            # --- 核心修复结束 ---
             
-            # 场景A: 价格止损 (Taker)
-            # 如果亏损超过设定比例（如 1%），则认赔离场，直接砸给买一
+            # 止损逻辑
             if pnl_pct < -self.cfg.STOP_LOSS_PCT:
-                logger.warning(f"🚨 触发价格止损 ({pnl_pct*100:.2f}%) -> Taker")
                 target_price = best_bid
                 post_only = False
-            
-            # 场景B: 超时止损 (Maker)
-            # 如果持仓时间太久（如 135秒），为了释放资金，允许跟随市场卖一（可能会小亏）
-            elif duration > 135: 
-                logger.warning(f"⏰ 触发超时止损 ({duration:.0f}s) -> Maker")
+                logger.warning(f"🚨 止损 -> Taker")
+            elif duration > 135:
                 target_price = best_ask
+                logger.warning(f"⏰ 超时 -> Maker")
                 
             self._place_order("Ask", target_price, self.held_qty, post_only=post_only)
         
+        # 2. 如果已有挂单
         else:
-            # 已有卖单，检查是否需要调整
-            # 只有在【超时止损】模式下，我们才允许向下移动挂单去追市场
+            # 检查是否为 [卖单] (防止状态错乱)
+            if self.active_order_side != 'Ask':
+                self.cancel_all()
+                return
+
+            # 如果是部分成交剩余的单子，或者是超时单，检查是否需要调整
+            # 只有超时后才去调整价格，否则死守 Ask 或 保本价
             if (time.time() - self.hold_start_time > 135):
-                 # 如果当前挂单价格 不等于 市场卖一，说明市场跑了，我们需要撤单重挂
-                 # 注意：这里加个小阈值判断防止频繁撤单会更好，但为了简化直接判断不等
+                 # 市场卖一跑远了，追过去
                  if abs(self.active_order_price - best_ask) > self.tick_size / 2:
                     logger.info("超时追单调整...")
                     self.cancel_all()
