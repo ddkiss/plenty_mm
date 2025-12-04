@@ -54,123 +54,149 @@ class TickScalper:
         }
 
     def init_market_info(self):
-        markets = self.rest.get_markets()
-        for m in markets:
-            if m['symbol'] == self.symbol:
-                filters = m['filters']
-                self.tick_size = float(filters['price']['tickSize'])
-                self.step_size = float(filters['quantity']['stepSize'])
-                self.min_qty = float(filters['quantity']['minQuantity'])
-                self.base_precision = len(str(self.step_size).split('.')[1]) if '.' in str(self.step_size) else 0
-                self.quote_precision = len(str(self.tick_size).split('.')[1]) if '.' in str(self.tick_size) else 0
-                logger.info(f"Market Info Loaded: Tick={self.tick_size}, Step={self.step_size}, MinQty={self.min_qty}")
-                return
-        logger.error("Symbol not found!")
-        exit(1)
+        try:
+            markets = self.rest.get_markets()
+            for m in markets:
+                if m['symbol'] == self.symbol:
+                    filters = m['filters']
+                    self.tick_size = float(filters['price']['tickSize'])
+                    self.step_size = float(filters['quantity']['stepSize'])
+                    self.min_qty = float(filters['quantity']['minQuantity'])
+                    self.base_precision = len(str(self.step_size).split('.')[1]) if '.' in str(self.step_size) else 0
+                    self.quote_precision = len(str(self.tick_size).split('.')[1]) if '.' in str(self.tick_size) else 0
+                    logger.info(f"Market Info Loaded: Tick={self.tick_size}, Step={self.step_size}, MinQty={self.min_qty}")
+                    return
+            logger.error("Symbol not found!")
+            exit(1)
+        except Exception as e:
+            logger.error(f"Init Market Info Failed: {e}")
+            exit(1)
 
     def get_usdc_balance(self):
         """获取用于交易的可用余额"""
-        # 1. 合约交易 (PERP)
-        if "PERP" in self.symbol:
-            col_res = self.rest.get_collateral()
-            if isinstance(col_res, dict):
-                if "netEquityAvailable" in col_res:
-                    return float(col_res["netEquityAvailable"])
-                
-                # Fallback logic
-                total_col = 0.0
-                assets = col_res.get("collateral", []) or col_res.get("assets", [])
-                for asset in assets:
-                    if asset.get("symbol") == "USDC":
-                        total_col += float(asset.get("availableQuantity", 0))
-                        total_col += float(asset.get("lendQuantity", 0))
-                return total_col
+        try:
+            # 1. 合约交易 (PERP)
+            if "PERP" in self.symbol:
+                col_res = self.rest.get_collateral()
+                if isinstance(col_res, dict):
+                    if "netEquityAvailable" in col_res:
+                        return float(col_res["netEquityAvailable"])
+                    
+                    # Fallback logic
+                    total_col = 0.0
+                    assets = col_res.get("collateral", []) or col_res.get("assets", [])
+                    for asset in assets:
+                        if asset.get("symbol") == "USDC":
+                            total_col += float(asset.get("availableQuantity", 0))
+                            total_col += float(asset.get("lendQuantity", 0))
+                    return total_col
 
-        # 2. 现货交易 (Spot)
-        spot_res = self.rest.get_balance()
-        if isinstance(spot_res, dict) and "USDC" in spot_res:
-            data = spot_res["USDC"]
-            if isinstance(data, dict):
-                return float(data.get("available", 0))
-            else:
-                return float(data)
+            # 2. 现货交易 (Spot)
+            spot_res = self.rest.get_balance()
+            if isinstance(spot_res, dict) and "USDC" in spot_res:
+                data = spot_res["USDC"]
+                if isinstance(data, dict):
+                    return float(data.get("available", 0))
+                else:
+                    return float(data)
+        except Exception as e:
+            logger.error(f"Get Balance Error: {e}")
         
         return 0.0
 
     def on_order_update(self, data):
         """ WebSocket 回调: 核心状态管理 """
-        event = data.get('e')
-        if event == 'orderFill':
-            side = data.get('S') # Bid/Ask
-            price = float(data.get('L')) # Fill Price
-            qty = float(data.get('l'))   # Fill Qty
-            is_maker = data.get('m', False) # Maker Flag
-            fee = float(data.get('n', 0))   # Fee Amount
+        try:
+            event = data.get('e')
             
-            logger.info(f"⚡ 成交: {side} {qty} @ {price} | Maker: {is_maker}")
-            
-            # --- 更新统计数据 ---
-            self.stats['trade_count'] += 1
-            quote_val = price * qty
-            self.stats['total_quote_vol'] += quote_val
-            self.stats['total_fee'] += fee
-            
-            # --- 买入逻辑 (Bid) ---
-            if side == "Bid":
-                # 更新统计
-                self.stats['total_buy_qty'] += qty
-                if is_maker: self.stats['maker_buy_qty'] += qty
-                else: self.stats['taker_buy_qty'] += qty
-                
-                # 累加持仓
-                if self.held_qty > 0:
-                    total_val = (self.held_qty * self.avg_cost) + (qty * price)
-                    self.held_qty += qty
-                    self.avg_cost = total_val / self.held_qty
-                else:
-                    self.held_qty = qty
-                    self.avg_cost = price
-                    self.hold_start_time = time.time()
-
-                self.state = "SELLING"
-                
-                # 截断式处理：防止幽灵买单
-                if self.active_order_id and self.active_order_side == 'Bid':
-                    logger.info("部分成交 -> 撤销剩余买单以锁定仓位")
-                    self.cancel_all()
-
-            # --- 卖出逻辑 (Ask) ---
-            elif side == "Ask":
-                # 更新统计
-                self.stats['total_sell_qty'] += qty
-                if is_maker: self.stats['maker_sell_qty'] += qty
-                else: self.stats['taker_sell_qty'] += qty
-                
-                # 计算盈亏 (Gross PnL)
-                trade_pnl = (price - self.avg_cost) * qty
-                self.stats['total_pnl'] += trade_pnl
-                
-                # 扣减持仓
-                self.held_qty -= qty
-                if self.held_qty < 0: self.held_qty = 0
-
-                logger.info(f"💰 卖出反馈 (PnL: {trade_pnl:.4f}) | 剩余持仓: {self.held_qty:.4f}")
-
-                if self.held_qty < self.min_qty:
-                    # 全部卖完
-                    self.state = "IDLE"
+            # --- [修复] 处理订单取消/过期事件 ---
+            if event in ['orderCancel', 'orderExpire']:
+                order_id = data.get('i')
+                # 如果被取消的是当前活跃订单，必须立即重置 ID，防止策略死锁
+                if order_id == self.active_order_id:
+                    logger.warning(f"⚠️ 订单 {order_id} 已取消/过期，重置状态")
                     self.active_order_id = None
                     self.active_order_side = None
-                    self.held_qty = 0
+                    # 如果是在买入阶段被取消，重置回 IDLE 重新开始
+                    if self.state == "BUYING":
+                        self.state = "IDLE"
+                    # 如果是在卖出阶段被取消，保持 SELLING 状态，主循环会自动补单
+                return
+
+            # --- 处理成交事件 ---
+            if event == 'orderFill':
+                side = data.get('S') # Bid/Ask
+                price = float(data.get('L')) # Fill Price
+                qty = float(data.get('l'))   # Fill Qty
+                is_maker = data.get('m', False) # Maker Flag
+                fee = float(data.get('n', 0))   # Fee Amount
+                
+                logger.info(f"⚡ 成交: {side} {qty} @ {price} | Maker: {is_maker}")
+                
+                # 更新统计数据
+                self.stats['trade_count'] += 1
+                quote_val = price * qty
+                self.stats['total_quote_vol'] += quote_val
+                self.stats['total_fee'] += fee
+                
+                # --- 买入逻辑 (Bid) ---
+                if side == "Bid":
+                    # 更新统计
+                    self.stats['total_buy_qty'] += qty
+                    if is_maker: self.stats['maker_buy_qty'] += qty
+                    else: self.stats['taker_buy_qty'] += qty
                     
-                    if trade_pnl < 0:
-                        self.last_cool_down = time.time()
-                        logger.warning(f"🛑 亏损冷却 {self.cfg.COOL_DOWN}s")
+                    # 累加持仓
+                    if self.held_qty > 0:
+                        total_val = (self.held_qty * self.avg_cost) + (qty * price)
+                        self.held_qty += qty
+                        self.avg_cost = total_val / self.held_qty
+                    else:
+                        self.held_qty = qty
+                        self.avg_cost = price
+                        self.hold_start_time = time.time()
+
+                    self.state = "SELLING"
+                    
+                    # 截断式处理：防止幽灵买单
+                    if self.active_order_id and self.active_order_side == 'Bid':
+                        logger.info("部分成交 -> 撤销剩余买单以锁定仓位")
+                        self.cancel_all()
+
+                # --- 卖出逻辑 (Ask) ---
+                elif side == "Ask":
+                    # 更新统计
+                    self.stats['total_sell_qty'] += qty
+                    if is_maker: self.stats['maker_sell_qty'] += qty
+                    else: self.stats['taker_sell_qty'] += qty
+                    
+                    # 计算盈亏 (Gross PnL)
+                    trade_pnl = (price - self.avg_cost) * qty
+                    self.stats['total_pnl'] += trade_pnl
+                    
+                    # 扣减持仓
+                    self.held_qty -= qty
+                    if self.held_qty < 0: self.held_qty = 0
+
+                    logger.info(f"💰 卖出反馈 (PnL: {trade_pnl:.4f}) | 剩余持仓: {self.held_qty:.4f}")
+
+                    if self.held_qty < self.min_qty:
+                        # 全部卖完
+                        self.state = "IDLE"
+                        self.active_order_id = None
+                        self.active_order_side = None
+                        self.held_qty = 0
                         
-                    # [打印触发点] 卖出结束时打印完整统计
-                    self._print_stats()
-                else:
-                    logger.info(f"⏳ 部分卖出，剩余 {self.held_qty:.4f} 等待成交...")
+                        if trade_pnl < 0:
+                            self.last_cool_down = time.time()
+                            logger.warning(f"🛑 亏损冷却 {self.cfg.COOL_DOWN}s")
+                            
+                        # 卖出结束时打印完整统计
+                        self._print_stats()
+                    else:
+                        logger.info(f"⏳ 部分卖出，剩余 {self.held_qty:.4f} 等待成交...")
+        except Exception as e:
+            logger.error(f"Order Update Error: {e}")
 
     def _print_stats(self):
         """打印详细的统计报表"""
@@ -229,9 +255,6 @@ class TickScalper:
         while self.running:
             time.sleep(0.5)
             
-            # [已移除] 定时打印逻辑
-            # if time.time() - self.last_stats_print > 300: ...
-            
             # 1. 冷却
             if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
                 continue
@@ -282,8 +305,11 @@ class TickScalper:
         if usdc_available <= 0: return
         
         qty = (usdc_available * self.cfg.BALANCE_PCT * self.cfg.LEVERAGE) / best_bid
-        self._place_order("Bid", best_bid, qty, post_only=True)
-        self.state = "BUYING"
+        
+        # [修复] 只有下单成功才切换状态
+        order_id = self._place_order("Bid", best_bid, qty, post_only=True)
+        if order_id:
+            self.state = "BUYING"
 
     def _logic_chase_buy(self, best_bid):
         if not self.active_order_id: 
