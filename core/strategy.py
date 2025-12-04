@@ -109,7 +109,7 @@ class TickScalper:
         return 0.0
 
     def on_order_update(self, data):
-        # [新增] 如果策略未正式激活（处于清仓阶段），忽略所有订单推送
+        # 如果策略未正式激活（处于清仓阶段），忽略所有订单推送
         if not self.strategy_active:
             return
         try:
@@ -136,8 +136,9 @@ class TickScalper:
                 qty = float(data.get('l'))   # Fill Qty
                 is_maker = data.get('m', False) # Maker Flag
                 fee = float(data.get('n', 0))   # Fee Amount
-                
-                logger.info(f"⚡ 成交: {side} {qty} @ {price} | Maker: {is_maker}")
+                status = data.get('X')
+
+                logger.info(f"⚡ 成交: {side} {qty} @ {price} | Maker: {is_maker} | Status: {status}")
                 
                 # 更新统计数据
                 self.stats['trade_count'] += 1
@@ -166,8 +167,15 @@ class TickScalper:
                     
                     # 截断式处理：防止幽灵买单
                     if self.active_order_id and self.active_order_side == 'Bid':
-                        logger.info("部分成交 -> 撤销剩余买单以锁定仓位")
-                        self.cancel_all()
+                        # 只有在非完全成交时才撤单
+                        if status == 'Filled':
+                            logger.info("✅ 买单完全成交，准备卖出")
+                            self.active_order_id = None
+                            self.active_order_side = None
+                        else:
+                            # 确实是部分成交，执行截断策略（防止剩余部分在高位成交）
+                            logger.info("✂️ 部分成交 -> 撤销剩余买单以锁定仓位")
+                            self.cancel_all()
 
                 # --- 卖出逻辑 (Ask) ---
                 elif side == "Ask":
@@ -186,7 +194,8 @@ class TickScalper:
 
                     logger.info(f"💰 卖出反馈 (PnL: {trade_pnl:.4f}) | 剩余持仓: {self.held_qty:.4f}")
 
-                    if self.held_qty < self.min_qty:
+                    #if self.held_qty < self.min_qty:
+                    if status == 'Filled':    
                         # 全部卖完
                         self.state = "IDLE"
                         self.active_order_id = None
