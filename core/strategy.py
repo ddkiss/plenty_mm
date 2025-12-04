@@ -323,10 +323,10 @@ class TickScalper:
         order_duration = time.time() - self.active_order_time
         
         # 2. 计算触发价格阈值 (当前挂单价 + 3个最小跳动单位)
-        chase_threshold = self.active_order_price + (3 * self.tick_size)
+        chase_threshold = self.active_order_price + (4 * self.tick_size)
         
         # 3. 判断核心逻辑：同时满足 [时间超过5秒] 且 [价格偏离超过5tick]
-        if (order_duration > 5) and (best_bid > chase_threshold):
+        if (order_duration > 10) and (best_bid > chase_threshold):
             logger.info(f"🚀 追涨触发: 挂单已持续 {order_duration:.1f}s 且 市场价{best_bid} > 阈值{chase_threshold:.5f}")
             self.cancel_all()
             self.state = "IDLE"
