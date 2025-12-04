@@ -245,6 +245,57 @@ class TickScalper:
                 logger.error(f"撤单失败: {e}")
         self.active_order_id = None
         self.active_order_side = None
+        
+    def _place_market_order(self, side, qty):
+        """执行市价单"""
+        # 按照步长修正数量精度
+        qty = floor_to(qty, self.base_precision)
+        if qty < self.min_qty: 
+            return
+
+        logger.info(f"🧹 执行市价清仓 [{side}]: {qty}")
+        order_data = {
+            "symbol": self.symbol,
+            "side": side,
+            "orderType": "Market", # 市价单
+            "quantity": str(qty)
+        }
+        # 注意：市价单不能使用 postOnly
+        self.rest.execute_order(order_data)
+
+    def clear_open_positions(self):
+        """识别现货或合约并清空所有持仓"""
+        logger.info("检查并清理现有持仓...")
+        try:
+            # --- 合约 (PERP) 清仓逻辑 ---
+            if "PERP" in self.symbol:
+                positions = self.rest.get_positions()
+                if isinstance(positions, list):
+                    for pos in positions:
+                        if pos.get('symbol') == self.symbol:
+                            # netQuantity > 0 (多仓) -> Sell, < 0 (空仓) -> Buy
+                            net_qty = float(pos.get('netQuantity', 0))
+                            if abs(net_qty) > self.min_qty:
+                                side = "Ask" if net_qty > 0 else "Bid"
+                                self._place_market_order(side, abs(net_qty))
+            
+            # --- 现货 (Spot) 清仓逻辑 ---
+            else:
+                # 从 symbol 解析基础币种 (如 SOL_USDC -> SOL)
+                base_asset = self.symbol.split('_')[0]
+                balances = self.rest.get_balance()
+                
+                # 处理余额数据
+                if base_asset in balances:
+                    data = balances[base_asset]
+                    # 兼容可能的返回格式 (对象或直接数值)
+                    available = float(data['available']) if isinstance(data, dict) else float(data)
+                    
+                    if available > self.min_qty:
+                        self._place_market_order("Ask", available)
+
+        except Exception as e:
+            logger.error(f"清仓失败 (非致命错误): {e}")
 
     def run(self):
         self.init_market_info()
@@ -252,7 +303,8 @@ class TickScalper:
         self.running = True
         
         self.cancel_all()
-        logger.info(f"策略启动: {self.symbol} | 余额比例: {self.cfg.BALANCE_PCT} | 止损: {self.cfg.STOP_LOSS_PCT*100}%")
+        self.clear_open_positions() # 2. [新增] 市价清仓
+        logger.info(f"策略启动: {self.symbol} | 资金利用比例: {self.cfg.BALANCE_PCT} | 止损: {self.cfg.STOP_LOSS_PCT*100}%")
 
         while self.running:
             time.sleep(0.5)
