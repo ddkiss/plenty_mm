@@ -269,26 +269,33 @@ class TickScalper:
         try:
             # --- 合约 (PERP) 清仓逻辑 ---
             if "PERP" in self.symbol:
-                positions = self.rest.get_positions()
+                # [修改] 调用更新后的 get_positions，传入 symbol
+                positions = self.rest.get_positions(self.symbol)
+                
                 if isinstance(positions, list):
                     for pos in positions:
+                        # 再次确认 symbol (双重保险)
                         if pos.get('symbol') == self.symbol:
-                            # netQuantity > 0 (多仓) -> Sell, < 0 (空仓) -> Buy
                             net_qty = float(pos.get('netQuantity', 0))
                             if abs(net_qty) > self.min_qty:
                                 side = "Ask" if net_qty > 0 else "Bid"
+                                logger.info(f"🔍 发现持仓 {net_qty}，执行市价平仓...")
                                 self._place_market_order(side, abs(net_qty))
-            
+                            else:
+                                logger.info(f"当前无 {self.symbol} 持仓 (NetQty={net_qty})")
+                else:
+                    # 如果返回的不是列表且不是空列表（404已处理为空列表），打印错误
+                    if positions: 
+                        logger.error(f"获取持仓异常: {positions}")
+
             # --- 现货 (Spot) 清仓逻辑 ---
             else:
-                # 从 symbol 解析基础币种 (如 SOL_USDC -> SOL)
+                # ... (现货逻辑保持不变)
                 base_asset = self.symbol.split('_')[0]
                 balances = self.rest.get_balance()
                 
-                # 处理余额数据
                 if base_asset in balances:
                     data = balances[base_asset]
-                    # 兼容可能的返回格式 (对象或直接数值)
                     available = float(data['available']) if isinstance(data, dict) else float(data)
                     
                     if available > self.min_qty:
