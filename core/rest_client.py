@@ -49,14 +49,17 @@ class BackpackREST:
             return {"error": str(e)}
 
     def get_balance(self):
+        """获取现货余额"""
         return self._request("GET", "/api/v1/capital", "balanceQuery")
 
+    def get_collateral(self):
+        """获取合约抵押品余额"""
+        return self._request("GET", "/api/v1/capital/collateral", "collateralQuery")
+
     def get_markets(self):
-        # Public endpoint, no signature needed usually, but keeping consistent structure
         return requests.get(f"{self.base_url}/api/v1/markets").json()
 
     def execute_order(self, order_data):
-        # Flatten data for signature
         return self._request("POST", "/api/v1/order", "orderExecute", data=order_data)
 
     def cancel_open_orders(self, symbol):

@@ -47,6 +47,39 @@ class TickScalper:
         logger.error("Symbol not found!")
         exit(1)
 
+    def get_usdc_balance(self):
+        """合并获取现货和抵押品的 USDC 余额"""
+        total_usdc = 0.0
+        
+        # 1. 获取 Spot 余额
+        spot_res = self.rest.get_balance()
+        if isinstance(spot_res, dict) and "USDC" in spot_res:
+            total_usdc += float(spot_res["USDC"].get("available", 0))
+            
+        # 2. 获取 Collateral 余额 (针对 Perp)
+        if "PERP" in self.symbol:
+            col_res = self.rest.get_collateral()
+            # 结构可能是 {'USDC': {...}} 或 {'assets': [{'symbol': 'USDC', ...}]}，视 API 版本而定
+            # Backpack 文档通常返回类似 Spot 的结构或列表
+            # 这里做通用处理：
+            if isinstance(col_res, dict):
+                # 尝试直接获取
+                if "USDC" in col_res:
+                     total_usdc += float(col_res["USDC"].get("available", 0))
+                # 尝试从 assets 列表获取
+                elif "assets" in col_res:
+                    for asset in col_res["assets"]:
+                        if asset.get("symbol") == "USDC":
+                            # 抵押品通常看 availableQuantity
+                            total_usdc += float(asset.get("availableQuantity", 0))
+                # 尝试从 collateral 列表获取
+                elif "collateral" in col_res:
+                     for asset in col_res["collateral"]:
+                        if asset.get("symbol") == "USDC":
+                            total_usdc += float(asset.get("availableQuantity", 0))
+                            
+        return total_usdc
+
     def on_order_update(self, data):
         """ WebSocket 回调: 处理成交 """
         event = data.get('e')
@@ -113,7 +146,8 @@ class TickScalper:
         qty = floor_to(qty, self.base_precision)
         
         if qty < self.min_qty:
-            logger.warning(f"数量太小: {qty} < {self.min_qty}")
+            # 降低日志级别或增加判断，防止刷屏
+            # logger.warning(f"数量太小: {qty} < {self.min_qty}")
             return None
 
         order_data = {
@@ -139,10 +173,14 @@ class TickScalper:
         if self.active_order_id:
             return
 
-        # 获取余额
-        bal_res = self.rest.get_balance()
-        if "USDC" not in bal_res: return
-        usdc_available = float(bal_res["USDC"]["available"])
+        # 获取合并后的 USDC 余额
+        usdc_available = self.get_usdc_balance()
+        
+        if usdc_available <= 0:
+            # 只有当余额真的为0时偶尔提醒一下，避免刷屏
+            if int(time.time()) % 10 == 0:
+                logger.warning(f"可用余额不足 (USDC: {usdc_available})")
+            return
         
         # 计算下单量
         amount_usdc = usdc_available * self.cfg.BALANCE_PCT * self.cfg.LEVERAGE
