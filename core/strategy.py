@@ -18,6 +18,8 @@ class TickScalper:
         
         # State
         self.state = "IDLE"  # IDLE, BUYING, SELLING
+        # [新增] 策略激活状态标记，用于过滤启动时的清仓数据
+        self.strategy_active = False
         
         # Order Tracking
         self.active_order_id = None
@@ -107,7 +109,9 @@ class TickScalper:
         return 0.0
 
     def on_order_update(self, data):
-        """ WebSocket 回调: 核心状态管理 """
+        # [新增] 如果策略未正式激活（处于清仓阶段），忽略所有订单推送
+        if not self.strategy_active:
+            return
         try:
             event = data.get('e')
             
@@ -310,7 +314,14 @@ class TickScalper:
         self.running = True
         
         self.cancel_all()
-        self.clear_open_positions() # 2. [新增] 市价清仓
+        self.clear_open_positions() #  市价清仓
+
+        # [新增] 等待清仓订单的成交回报处理完毕，避免计入统计
+        logger.info("等待清仓完成...")
+        time.sleep(2)
+        # [新增] 标记策略正式激活，开始记录统计
+        self.strategy_active = True
+        
         logger.info(f"策略启动: {self.symbol} | 资金利用比例: {self.cfg.BALANCE_PCT} | 止损: {self.cfg.STOP_LOSS_PCT*100}%")
 
         while self.running:
