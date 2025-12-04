@@ -247,7 +247,7 @@ class TickScalper:
                 target_price = best_bid
                 post_only = False
                 logger.warning(f"🚨 止损 -> Taker")
-            elif duration > 135:
+            elif duration > self.cfg.STOP_LOSS_TIMEOUT:
                 target_price = best_ask
                 logger.warning(f"⏰ 超时 -> Maker")
                 
@@ -262,7 +262,7 @@ class TickScalper:
 
             # 如果是部分成交剩余的单子，或者是超时单，检查是否需要调整
             # 只有超时后才去调整价格，否则死守 Ask 或 保本价
-            if (time.time() - self.hold_start_time > 135):
+            if (time.time() - self.hold_start_time > self.cfg.STOP_LOSS_TIMEOUT):
                  # 市场卖一跑远了，追过去
                  if abs(self.active_order_price - best_ask) > self.tick_size / 2:
                     logger.info("超时追单调整...")

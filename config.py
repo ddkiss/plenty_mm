@@ -17,6 +17,9 @@ class Config:
     BALANCE_PCT = float(os.getenv("BALANCE_PCT", "0.8"))
     STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.01"))
     COOL_DOWN = int(os.getenv("COOL_DOWN", "30"))
+    # [新增] 超时止损时间 (秒)
+    # 这里会优先读取 .env 中的 STOP_LOSS_TIMEOUT，如果没填则默认为 120
+    STOP_LOSS_TIMEOUT = int(os.getenv("STOP_LOSS_TIMEOUT", "120"))
 
     if not API_KEY or not SECRET_KEY:
         raise ValueError("请在 .env 文件中配置 API_KEY 和 SECRET_KEY")
