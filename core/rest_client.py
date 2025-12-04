@@ -67,3 +67,6 @@ class BackpackREST:
 
     def get_open_orders(self, symbol):
         return self._request("GET", "/api/v1/orders", "orderQueryAll", params={"symbol": symbol})
+    
+    def get_positions(self):
+        return self._request("GET", "/api/v1/positions", "positionQueryAll")
