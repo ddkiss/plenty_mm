@@ -9,8 +9,8 @@ class TickScalper:
     def __init__(self, config):
         self.cfg = config
         self.symbol = config.SYMBOL
-        # [新增] 追涨冷却时间记录
-        self.last_chase_time = 0
+        # [新增] 记录挂单产生的时间
+        self.active_order_time = 0
         
         # Clients
         self.rest = BackpackREST(config.API_KEY, config.SECRET_KEY)
@@ -294,6 +294,8 @@ class TickScalper:
             self.active_order_id = res["id"]
             self.active_order_price = price
             self.active_order_side = side
+            # [新增] 记录挂单时间
+            self.active_order_time = time.time()
             logger.info(f"挂单成功 [{side}]: {qty} @ {price}")
             return res["id"]
         else:
@@ -317,17 +319,17 @@ class TickScalper:
         if not self.active_order_id: 
             self.state = "IDLE"
             return
-            
-        # [新增] 追涨冷却检查：如果距离上次追涨不足 5 秒，直接跳过
-        if time.time() - self.last_chase_time < 5:
-            return
-            
-        if best_bid > self.active_order_price + (5 * self.tick_size):
-            logger.info(f"🚀 追涨: 市场 {best_bid} > 挂单 {self.active_order_price} + 5tick")
+        # 1. 计算挂单存活时间
+        order_duration = time.time() - self.active_order_time
+        
+        # 2. 计算触发价格阈值 (当前挂单价 + 3个最小跳动单位)
+        chase_threshold = self.active_order_price + (3 * self.tick_size)
+        
+        # 3. 判断核心逻辑：同时满足 [时间超过5秒] 且 [价格偏离超过5tick]
+        if (order_duration > 5) and (best_bid > chase_threshold):
+            logger.info(f"🚀 追涨触发: 挂单已持续 {order_duration:.1f}s 且 市场价{best_bid} > 阈值{chase_threshold:.5f}")
             self.cancel_all()
             self.state = "IDLE"
-            # [新增] 更新追涨时间，触发冷却
-            self.last_chase_time = time.time()
 
     def _logic_sell(self, best_bid, best_ask):
         # 1. 如果没有挂单
