@@ -221,9 +221,9 @@ class TickScalper:
         run_time_str = str(timedelta(seconds=int(duration)))
         
         msg = (
-            f"\n{'='*15} 统计汇总 {'='*15}\n"
+            f"\n{'='*10} {self.symbol} 统计汇总 {'='*10}\n"
             f"运行时间: {run_time_str}\n"
-            f"总成交量{self.symbol}: {total_vol:.4f} (买 {self.stats['total_buy_qty']:.4f} | 卖 {self.stats['total_sell_qty']:.4f})\n"
+            f"总成交量: {total_vol:.4f} (买 {self.stats['total_buy_qty']:.4f} | 卖 {self.stats['total_sell_qty']:.4f})\n"
             f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"
             f"Maker总量: {maker_vol:.4f} ({maker_ratio:.1f}%)\n"
             f"Taker总量: {(total_vol - maker_vol):.4f}\n"
