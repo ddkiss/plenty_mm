@@ -68,5 +68,26 @@ class BackpackREST:
     def get_open_orders(self, symbol):
         return self._request("GET", "/api/v1/orders", "orderQueryAll", params={"symbol": symbol})
     
-    def get_positions(self,symbol=None):
-        return self._request("GET", "/api/v1/position", "positionQueryAll")
+    def get_positions(self, symbol=None):
+        """获取永续合约仓位"""
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+
+        res = self._request("GET", "/api/v1/position", "positionQuery", params=params)
+        
+        # 特殊处理 404 错误 - 表示没有仓位，返回空列表
+        if isinstance(res, dict) and "error" in res:
+            error_msg = str(res["error"])
+            # 检查错误信息中是否包含 404 或 not found
+            if "404" in error_msg or "not found" in error_msg.lower():
+                logger.info(f"仓位查询返回 404，确认无活跃仓位 ({symbol})")
+                return []
+            # 其他错误原样返回
+            return res
+
+        # 兼容性处理：如果 API 返回单个字典对象（非列表），将其包装为列表
+        if isinstance(res, dict) and "symbol" in res:
+            return [res]
+            
+        return res
