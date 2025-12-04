@@ -9,6 +9,8 @@ class TickScalper:
     def __init__(self, config):
         self.cfg = config
         self.symbol = config.SYMBOL
+        # [新增] 追涨冷却时间记录
+        self.last_chase_time = 0
         
         # Clients
         self.rest = BackpackREST(config.API_KEY, config.SECRET_KEY)
@@ -316,10 +318,16 @@ class TickScalper:
             self.state = "IDLE"
             return
             
+        # [新增] 追涨冷却检查：如果距离上次追涨不足 5 秒，直接跳过
+        if time.time() - self.last_chase_time < 5:
+            return
+            
         if best_bid > self.active_order_price + (5 * self.tick_size):
             logger.info(f"🚀 追涨: 市场 {best_bid} > 挂单 {self.active_order_price} + 5tick")
             self.cancel_all()
             self.state = "IDLE"
+            # [新增] 更新追涨时间，触发冷却
+            self.last_chase_time = time.time()
 
     def _logic_sell(self, best_bid, best_ask):
         # 1. 如果没有挂单
