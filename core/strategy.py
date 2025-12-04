@@ -1,5 +1,6 @@
 import time
 import threading
+from datetime import timedelta
 from .utils import logger, round_to_step, floor_to
 from .rest_client import BackpackREST
 from .ws_client import BackpackWS
@@ -19,7 +20,7 @@ class TickScalper:
         # Order Tracking
         self.active_order_id = None
         self.active_order_price = 0.0
-        self.active_order_side = None # 新增：记录当前挂单方向
+        self.active_order_side = None 
         
         # Position Tracking
         self.held_qty = 0.0
@@ -36,6 +37,21 @@ class TickScalper:
         # Control
         self.last_cool_down = 0
         self.running = False
+        
+        # --- 统计数据 ---
+        self.start_time = time.time()
+        self.stats = {
+            'total_buy_qty': 0.0,
+            'total_sell_qty': 0.0,
+            'total_quote_vol': 0.0,  # 总成交额 (USDC)
+            'maker_buy_qty': 0.0,
+            'maker_sell_qty': 0.0,
+            'taker_buy_qty': 0.0,
+            'taker_sell_qty': 0.0,
+            'total_pnl': 0.0,        # 累计盈亏 (扣除手续费前)
+            'total_fee': 0.0,        # 累计手续费
+            'trade_count': 0         # 成交次数
+        }
 
     def init_market_info(self):
         markets = self.rest.get_markets()
@@ -88,12 +104,25 @@ class TickScalper:
             side = data.get('S') # Bid/Ask
             price = float(data.get('L')) # Fill Price
             qty = float(data.get('l'))   # Fill Qty
-            logger.info(f"⚡ 成交: {side} {qty} @ {price}")
+            is_maker = data.get('m', False) # Maker Flag
+            fee = float(data.get('n', 0))   # Fee Amount
+            
+            logger.info(f"⚡ 成交: {side} {qty} @ {price} | Maker: {is_maker}")
+            
+            # --- 更新统计数据 ---
+            self.stats['trade_count'] += 1
+            quote_val = price * qty
+            self.stats['total_quote_vol'] += quote_val
+            self.stats['total_fee'] += fee
             
             # --- 买入逻辑 (Bid) ---
             if side == "Bid":
-                # 1. 累加持仓 (防止多次部分成交导致数据覆盖)
-                # 计算加权平均成本 (简化版：如果已有持仓，做加权)
+                # 更新统计
+                self.stats['total_buy_qty'] += qty
+                if is_maker: self.stats['maker_buy_qty'] += qty
+                else: self.stats['taker_buy_qty'] += qty
+                
+                # 累加持仓
                 if self.held_qty > 0:
                     total_val = (self.held_qty * self.avg_cost) + (qty * price)
                     self.held_qty += qty
@@ -103,44 +132,81 @@ class TickScalper:
                     self.avg_cost = price
                     self.hold_start_time = time.time()
 
-                # 2. 状态流转: 只要买到了，就准备卖
                 self.state = "SELLING"
                 
-                # 3. [关键修正] 截断式处理
-                # 如果当前策略认为还在挂买单，说明可能只是部分成交。
-                # 为了防止"幽灵买单"，必须立即撤销剩余的买单！
+                # 截断式处理：防止幽灵买单
                 if self.active_order_id and self.active_order_side == 'Bid':
                     logger.info("部分成交 -> 撤销剩余买单以锁定仓位")
-                    self.cancel_all() # 强制撤单，确保不再买入
-                    # cancel_all 会重置 active_order_id
+                    self.cancel_all()
 
             # --- 卖出逻辑 (Ask) ---
             elif side == "Ask":
-                # 1. 扣减持仓
+                # 更新统计
+                self.stats['total_sell_qty'] += qty
+                if is_maker: self.stats['maker_sell_qty'] += qty
+                else: self.stats['taker_sell_qty'] += qty
+                
+                # 计算盈亏 (Gross PnL)
+                trade_pnl = (price - self.avg_cost) * qty
+                self.stats['total_pnl'] += trade_pnl
+                
+                # 扣减持仓
                 self.held_qty -= qty
-                if self.held_qty < 0: self.held_qty = 0 # 防御性归零
+                if self.held_qty < 0: self.held_qty = 0
 
-                profit = (price - self.avg_cost) * qty
-                logger.info(f"💰 卖出反馈 (PnL: {profit:.4f}) | 剩余持仓: {self.held_qty:.4f}")
+                logger.info(f"💰 卖出反馈 (PnL: {trade_pnl:.4f}) | 剩余持仓: {self.held_qty:.4f}")
 
-                # 2. 判断是否卖完
                 if self.held_qty < self.min_qty:
-                    # 全部卖完了
+                    # 全部卖完
                     self.state = "IDLE"
-                    self.active_order_id = None # 清理 ID，允许下一轮买入
+                    self.active_order_id = None
                     self.active_order_side = None
                     self.held_qty = 0
                     
-                    if profit < 0:
+                    if trade_pnl < 0:
                         self.last_cool_down = time.time()
                         logger.warning(f"🛑 亏损冷却 {self.cfg.COOL_DOWN}s")
+                        
+                    # [打印触发点] 卖出结束时打印完整统计
+                    self._print_stats()
                 else:
-                    # 3. [关键修正] 部分卖出
-                    # 还有剩余持仓，说明订单还没跑完。
-                    # *不要* 清除 active_order_id，也不要改状态。
-                    # 让挂在交易所的剩余卖单继续跑。
                     logger.info(f"⏳ 部分卖出，剩余 {self.held_qty:.4f} 等待成交...")
-                    # 保持 active_order_id 不变，_logic_sell 会看到 ID 存在而不做操作
+
+    def _print_stats(self):
+        """打印详细的统计报表"""
+        now = time.time()
+        duration = now - self.start_time
+        
+        # 计算净利润 (盈亏 - 手续费)
+        net_pnl = self.stats['total_pnl'] - self.stats['total_fee']
+        
+        # 计算磨损率 (净盈亏 / 总成交额)
+        wear_rate = 0.0
+        if self.stats['total_quote_vol'] > 0:
+            wear_rate = (net_pnl / self.stats['total_quote_vol']) * 100
+            
+        # 计算 Maker 占比
+        total_vol = self.stats['total_buy_qty'] + self.stats['total_sell_qty']
+        maker_vol = self.stats['maker_buy_qty'] + self.stats['maker_sell_qty']
+        maker_ratio = (maker_vol / total_vol * 100) if total_vol > 0 else 0
+        
+        run_time_str = str(timedelta(seconds=int(duration)))
+        
+        msg = (
+            f"\n{'='*15} 统计汇总 {'='*15}\n"
+            f"运行时间: {run_time_str}\n"
+            f"总成交量: {total_vol:.4f} (买 {self.stats['total_buy_qty']:.4f} | 卖 {self.stats['total_sell_qty']:.4f})\n"
+            f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"
+            f"Maker总量: {maker_vol:.4f} ({maker_ratio:.1f}%)\n"
+            f"Taker总量: {(total_vol - maker_vol):.4f}\n"
+            f"----------------------------------------\n"
+            f"累计毛利: {self.stats['total_pnl']:.4f} USDC\n"
+            f"累计手续费: {self.stats['total_fee']:.4f} USDC\n"
+            f"净利润:   {net_pnl:.4f} USDC\n"
+            f"磨损率:   {wear_rate:.5f}%\n"
+            f"{'='*38}\n"
+        )
+        logger.info(msg)
 
     def cancel_all(self):
         """撤销所有订单并重置跟踪 ID"""
@@ -162,6 +228,9 @@ class TickScalper:
 
         while self.running:
             time.sleep(0.5)
+            
+            # [已移除] 定时打印逻辑
+            # if time.time() - self.last_stats_print > 300: ...
             
             # 1. 冷却
             if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
@@ -199,7 +268,7 @@ class TickScalper:
         if "id" in res:
             self.active_order_id = res["id"]
             self.active_order_price = price
-            self.active_order_side = side # 记录方向
+            self.active_order_side = side
             logger.info(f"挂单成功 [{side}]: {qty} @ {price}")
             return res["id"]
         else:
@@ -227,7 +296,7 @@ class TickScalper:
             self.state = "IDLE"
 
     def _logic_sell(self, best_bid, best_ask):
-        # 1. 如果没有挂单，则计算价格挂单
+        # 1. 如果没有挂单
         if not self.active_order_id:
             if self.avg_cost == 0: self.avg_cost = best_bid
             if self.held_qty < self.min_qty: 
@@ -255,15 +324,11 @@ class TickScalper:
         
         # 2. 如果已有挂单
         else:
-            # 检查是否为 [卖单] (防止状态错乱)
             if self.active_order_side != 'Ask':
                 self.cancel_all()
                 return
 
-            # 如果是部分成交剩余的单子，或者是超时单，检查是否需要调整
-            # 只有超时后才去调整价格，否则死守 Ask 或 保本价
             if (time.time() - self.hold_start_time > self.cfg.STOP_LOSS_TIMEOUT):
-                 # 市场卖一跑远了，追过去
                  if abs(self.active_order_price - best_ask) > self.tick_size / 2:
                     logger.info("超时追单调整...")
                     self.cancel_all()
