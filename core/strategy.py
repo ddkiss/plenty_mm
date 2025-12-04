@@ -316,8 +316,8 @@ class TickScalper:
             self.state = "IDLE"
             return
             
-        if best_bid > self.active_order_price * (1 + 0.0001):
-            logger.info(f"🚀 追涨: 市场 {best_bid} > 挂单 {self.active_order_price}")
+        if best_bid > self.active_order_price + (5 * self.tick_size):
+            logger.info(f"🚀 追涨: 市场 {best_bid} > 挂单 {self.active_order_price} + 5tick")
             self.cancel_all()
             self.state = "IDLE"
 
