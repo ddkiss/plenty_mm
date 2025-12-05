@@ -441,7 +441,7 @@ class TickScalper:
                 self._check_order_via_rest()
                 
                 if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
-                    logger.warning("盘口数据为空")
+                    
                     continue
 
                 # 获取深度 (limit=5)
@@ -453,6 +453,7 @@ class TickScalper:
                 asks = depth.get("asks", [])
 
                 if not bids or not asks:
+                    logger.warning("盘口数据为空")
                     continue
                 
                 # --- [修正开始] 稳健的 BBO 获取逻辑 ---
