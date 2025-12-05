@@ -256,46 +256,19 @@ class TickScalper:
         self.active_order_side = None
 
     def _sync_position_state(self):
-        """强制同步链上持仓数据，修复本地状态偏差"""
+        """[复用] 强制同步持仓状态，用于撤单后或定期校准"""
         try:
-            # 1. 合约 (PERP) 同步逻辑
-            if "PERP" in self.symbol:
-                positions = self.rest.get_positions(self.symbol)
-                # 处理 API 返回格式 (可能是列表，也可能是字典，取决于 rest_client 处理)
-                target_qty = 0.0
-                
-                if isinstance(positions, list):
-                    # 遍历列表找到当前交易对
-                    target_pos = next((p for p in positions if p.get('symbol') == self.symbol), None)
-                    if target_pos:
-                        target_qty = float(target_pos.get('netQuantity', 0))
-                elif isinstance(positions, dict):
-                    # 单对象情况
-                    if positions.get('symbol') == self.symbol:
-                        target_qty = float(positions.get('netQuantity', 0))
-                
-                # 更新持仓（取绝对值，因为策略主要做多，但也兼容空头展示）
-                self.held_qty = abs(target_qty)
-
-            # 2. 现货 (Spot) 同步逻辑
-            else:
-                base_asset = self.symbol.split('_')[0] # 例如 SOL_USDC -> SOL
-                balances = self.rest.get_balance()
-                
-                if base_asset in balances:
-                    data = balances[base_asset]
-                    # 兼容 backpack 返回格式 {"available": ...} 或直接数值
-                    available = float(data.get('available', 0)) if isinstance(data, dict) else float(data)
-                    self.held_qty = available
-                else:
-                    self.held_qty = 0.0
+            real_qty = self._get_real_position() # 调用新的通用查询方法
             
-            # 过滤极小粉尘，避免精度干扰
+            # 只有当数量发生变化时才打印日志，减少刷屏
+            if real_qty != self.held_qty:
+                logger.info(f"🔄 持仓校准: 本地{self.held_qty} -> 链上{real_qty}")
+                self.held_qty = real_qty
+                
+            # 过滤粉尘
             if self.held_qty < self.min_qty:
                 self.held_qty = 0.0
                 
-            logger.info(f"🔄 状态同步完成 | 修正持仓: {self.held_qty}")
-            
         except Exception as e:
             logger.error(f"持仓同步失败: {e}")
 
@@ -366,11 +339,12 @@ class TickScalper:
         self.cancel_all()
         
         # 初始同步一次持仓
-        self.held_qty = self._get_real_position() 
+        self._sync_position_state() # <--- 这里直接调用同步方法
+        
         if self.held_qty > self.min_qty:
             logger.info(f"发现初始持仓: {self.held_qty}，进入卖出模式")
             self.state = "SELLING"
-            self.avg_cost = self.ws.best_bid # 丢失成本价，暂用当前价代替
+            self.avg_cost = self.ws.best_bid
             
         self.strategy_active = True
         logger.info(f"策略启动: {self.symbol} | 资金利用比例: {self.cfg.BALANCE_PCT} | 止损: {self.cfg.STOP_LOSS_PCT*100}%")
