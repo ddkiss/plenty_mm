@@ -58,22 +58,22 @@ class BackpackWS:
         logger.info(f"已订阅行情: bookTicker.{self.symbol}")
         
         # 2. 订阅私有订单更新流 (用于捕捉成交)
-        timestamp = str(int(time.time() * 1000))
-        window = "5000"
+        # timestamp = str(int(time.time() * 1000))
+        # window = "5000"
         
         # 生成签名
         # 注意：Backpack WS 订阅 instruction 固定为 "subscribe"
-        signature = create_signature(self.secret_key, "subscribe", {}, timestamp, window)
+        # signature = create_signature(self.secret_key, "subscribe", {}, timestamp, window)
         
-        if signature:
-            ws.send(json.dumps({
-                "method": "SUBSCRIBE", 
-                "params": [f"account.orderUpdate.{self.symbol}"],
-                "signature": [self.api_key, signature, timestamp, window]
-            }))
-            logger.info("已订阅私有订单流")
-        else:
-            logger.error("签名生成失败，无法订阅私有流")
+        # if signature:
+        #     ws.send(json.dumps({
+        #         "method": "SUBSCRIBE", 
+        #         "params": [f"account.orderUpdate.{self.symbol}"],
+        #         "signature": [self.api_key, signature, timestamp, window]
+        #     }))
+        #     logger.info("已订阅私有订单流")
+        # else:
+        #     logger.error("签名生成失败，无法订阅私有流")
 
     def _on_message(self, ws, message):
         try:
