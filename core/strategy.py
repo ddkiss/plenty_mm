@@ -1,4 +1,4 @@
-import time
+Fimport time
 import threading
 from datetime import datetime, timedelta
 from .utils import logger, round_to_step, floor_to
@@ -310,14 +310,34 @@ class TickScalper:
                 old_qty = self.held_qty
                 # 同步余额
                 self._sync_position_state()
-                # [新增] 补算撤单期间产生的成交量
+                #  补算撤单期间产生的成交量
                 filled_qty = abs(self.held_qty - old_qty)
                 if filled_qty > 0:
                     trade_val = filled_qty * self.active_order_price
+                    
+                    # --- [修改开始] 完善统计逻辑 ---
                     self.stats['total_quote_vol'] += trade_val
                     
+                    # 区分买卖方向
+                    if self.active_order_side == 'Bid':
+                        self.stats['total_buy_qty'] += filled_qty
+                        # 区分 Maker/Taker
+                        if self.active_order_is_maker:
+                            self.stats['maker_buy_qty'] += filled_qty
+                        else:
+                            self.stats['taker_buy_qty'] += filled_qty
+                    else:
+                        self.stats['total_sell_qty'] += filled_qty
+                        # 区分 Maker/Taker
+                        if self.active_order_is_maker:
+                            self.stats['maker_sell_qty'] += filled_qty
+                        else:
+                            self.stats['taker_sell_qty'] += filled_qty
+                    
+                    # 累加 Taker 成交额 (用于算费率)
                     if not self.active_order_is_maker:
                         self.stats['taker_quote_vol'] += trade_val
+                    # --- [修改结束] ---
                     
                     logger.info(f"📉 撤单发现部分成交: {filled_qty}")
             except Exception as e:
