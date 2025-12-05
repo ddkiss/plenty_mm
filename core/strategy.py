@@ -18,8 +18,10 @@ class TickScalper:
         
         # State
         self.state = "IDLE"  # IDLE, BUYING, SELLING
-        # [新增] 策略激活状态标记，用于过滤启动时的清仓数据
+        # 策略激活状态标记，用于过滤启动时的清仓数据
         self.strategy_active = False
+        # 连续亏损计数器
+        self.consecutive_loss_count = 0
         
         # Order Tracking
         self.active_order_id = None
@@ -194,7 +196,6 @@ class TickScalper:
 
                     logger.info(f"💰 卖出反馈 (PnL: {trade_pnl:.4f}) | 剩余持仓: {self.held_qty:.4f}")
 
-                    #if self.held_qty < self.min_qty:
                     if status == 'Filled':    
                         # 全部卖完
                         self.state = "IDLE"
@@ -202,9 +203,23 @@ class TickScalper:
                         self.active_order_side = None
                         self.held_qty = 0
                         
+                        # ============连续止损冷却机制 =================
                         if trade_pnl < 0:
-                            self.last_cool_down = time.time()
-                            logger.warning(f"🛑 亏损冷却 {self.cfg.COOL_DOWN}s")
+                            # 记录亏损次数
+                            self.consecutive_loss_count += 1
+                            logger.warning(f"📉 本次交易亏损，当前连续亏损次数: {self.consecutive_loss_count}")
+                            
+                            # 检查是否达到连续2次
+                            if self.consecutive_loss_count >= 2:
+                                self.last_cool_down = time.time()
+                                logger.warning(f"🛑 连续止损达标(2次)，触发冷却 {self.cfg.COOL_DOWN}s")
+                                # 触发冷却后重置计数，准备下个周期
+                                self.consecutive_loss_count = 0 
+                        else:
+                            # 如果本次是盈利的，直接打断连续亏损记录，重置为0
+                            if self.consecutive_loss_count > 0:
+                                logger.info("✅ 本次交易盈利，连续亏损计数已重置")
+                            self.consecutive_loss_count = 0
                             
                         # 卖出结束时打印完整统计
                         self._print_stats()
@@ -234,7 +249,7 @@ class TickScalper:
         run_time_str = str(timedelta(seconds=int(duration)))
         
         msg = (
-            f"\n{'='*10} {self.symbol} 统计汇总 {'='*10}\n"
+            f"\n{'='*2} {self.symbol} 统计汇总 {'='*4}\n"
             f"运行时间: {run_time_str}\n"
             f"总成交量: {total_vol:.4f} (买 {self.stats['total_buy_qty']:.4f} | 卖 {self.stats['total_sell_qty']:.4f})\n"
             f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"
@@ -245,7 +260,7 @@ class TickScalper:
             f"累计手续费: {self.stats['total_fee']:.4f} USDC\n"
             f"净利润:   {net_pnl:.4f} USDC\n"
             f"磨损率:   {wear_rate:.5f}%\n"
-            f"{'='*38}\n"
+            f"{'='*10}\n"
         )
         logger.info(msg)
 
