@@ -180,14 +180,34 @@ class TickScalper:
                 elif self.active_order_side == 'Ask':
                     if real_qty < self.held_qty:
                         logger.info(f"✅ 卖单成交 (持仓 {self.held_qty} -> {real_qty})")
-                        # 简单的盈亏记录
-                        pnl = (self.active_order_price - self.avg_cost) * (self.held_qty - real_qty)
-                        logger.info(f"💰 估算盈亏: {pnl:.4f} USDC")
+                        
+                        # [新增/迁移] 盈亏计算与统计更新
+                        trade_pnl = (self.active_order_price - self.avg_cost) * (self.held_qty - real_qty)
+                        self.stats['trade_count'] += 1
+                        self.stats['total_pnl'] += trade_pnl
+                        # 注意：REST轮询难以获取精确fee，暂时忽略或用估算值
                         
                         self.held_qty = real_qty
                         if self.held_qty < self.min_qty:
                             self.state = "IDLE"
                             self.held_qty = 0
+                            # [新增/迁移] 连续亏损冷却逻辑
+                            if trade_pnl < 0:
+                                self.consecutive_loss_count += 1
+                                logger.warning(f"📉 本次亏损，连续亏损计数: {self.consecutive_loss_count}")
+                                if self.consecutive_loss_count >= 2:
+                                    self.last_cool_down = time.time()
+                                    logger.warning(f"🛑 连续止损达标(2次)，触发冷却 {self.cfg.COOL_DOWN}s")
+                                    self.consecutive_loss_count = 0 
+                            else:
+                                if self.consecutive_loss_count > 0:
+                                    logger.info("✅ 本次盈利，连续亏损计数重置")
+                                self.consecutive_loss_count = 0
+                                
+                            # [新增] 打印报表
+                            self._print_stats()
+
+                    
                     else:
                         logger.info("❌ 卖单被取消 (持仓未减少)")
                         # 保持 SELLING 状态，主循环会重试
@@ -351,6 +371,9 @@ class TickScalper:
 
         while self.running:
             time.sleep(0.5)
+
+            # 核心检查逻辑
+            self._check_order_via_rest()
             
             # 1. 冷却
             if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
