@@ -56,6 +56,7 @@ class TickScalper:
             'maker_sell_qty': 0.0,
             'taker_buy_qty': 0.0,
             'taker_sell_qty': 0.0,
+            'taker_quote_vol': 0.0,  # [新增] Taker 总成交额 (USDC)
             'total_pnl': 0.0,        # 累计盈亏 (扣除手续费前)
             'total_fee': 0.0,        # 累计手续费
             'trade_count': 0         # 成交次数
@@ -165,6 +166,23 @@ class TickScalper:
                 
                 # 1. 立即同步真实持仓
                 real_qty = self._get_real_position()
+
+                #  统一计算成交数据
+                filled_qty = abs(real_qty - self.held_qty)
+                
+                if filled_qty > 0:
+                    trade_val = filled_qty * self.active_order_price # 成交额
+                    
+                    # 1. 累加基础统计
+                    self.stats['total_quote_vol'] += trade_val
+                    if self.active_order_side == 'Bid':
+                        self.stats['total_buy_qty'] += filled_qty
+                    else:
+                        self.stats['total_sell_qty'] += filled_qty
+                    
+                    # 2. 如果是 Taker 单，专门累加到 Taker 成交额中
+                    if not self.active_order_is_maker:
+                        self.stats['taker_quote_vol'] += trade_val
                 
                 # 2. 判断发生了什么
                 if self.active_order_side == 'Bid':
@@ -248,6 +266,12 @@ class TickScalper:
         # 获取东八区时间 (UTC时间 + 8小时)
         beijing_now = datetime.utcnow() + timedelta(hours=8)
         current_time_str = beijing_now.strftime('%m-%d %H:%M:%S')
+
+        # [新增] 估算总手续费 (Taker总额 * 费率)
+        self.stats['total_fee'] = self.stats['taker_quote_vol'] * self.cfg.TAKER_FEE_RATE
+        
+        # 计算净利润 (盈亏 - 手续费)
+        net_pnl = self.stats['total_pnl'] - self.stats['total_fee']
         
         msg = (
             f"\n{'='*3} {self.symbol} 统计汇总 {'='*3}\n"
@@ -270,8 +294,20 @@ class TickScalper:
         if self.active_order_id:
             try:
                 self.rest.cancel_open_orders(self.symbol)
+                # [新增] 记录撤单前的持仓，用于计算部分成交
+                old_qty = self.held_qty
                 # 同步余额
                 self._sync_position_state()
+                # [新增] 补算撤单期间产生的成交量
+                filled_qty = abs(self.held_qty - old_qty)
+                if filled_qty > 0:
+                    trade_val = filled_qty * self.active_order_price
+                    self.stats['total_quote_vol'] += trade_val
+                    
+                    if not self.active_order_is_maker:
+                        self.stats['taker_quote_vol'] += trade_val
+                    
+                    logger.info(f"📉 撤单发现部分成交: {filled_qty}")
             except Exception as e:
                 logger.error(f"撤单失败: {e}")
         self.active_order_id = None
@@ -414,6 +450,8 @@ class TickScalper:
             self.active_order_id = res["id"]
             self.active_order_price = price
             self.active_order_side = side
+            # [新增] 记录这笔单子是不是 Maker
+            self.active_order_is_maker = post_only
             # [新增] 记录挂单时间
             self.active_order_time = time.time()
             logger.info(f"挂单成功 [{side}]: {qty} @ {price}")
