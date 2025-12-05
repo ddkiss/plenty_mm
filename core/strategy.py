@@ -110,6 +110,95 @@ class TickScalper:
         
         return 0.0
 
+    def _get_real_position(self):
+        """[新增] 通过 REST API 获取当前真实的持仓数量"""
+        try:
+            # 1. 合约逻辑
+            if "PERP" in self.symbol:
+                positions = self.rest.get_positions(self.symbol)
+                if isinstance(positions, list):
+                    for p in positions:
+                        if p.get('symbol') == self.symbol:
+                            return abs(float(p.get('netQuantity', 0)))
+                elif isinstance(positions, dict) and positions.get('symbol') == self.symbol:
+                    return abs(float(positions.get('netQuantity', 0)))
+                return 0.0
+            
+            # 2. 现货逻辑
+            else:
+                base_asset = self.symbol.split('_')[0]
+                balances = self.rest.get_balance()
+                if base_asset in balances:
+                    data = balances[base_asset]
+                    # 兼容不同格式
+                    return float(data.get('available', 0)) if isinstance(data, dict) else float(data)
+                return 0.0
+        except Exception as e:
+            logger.error(f"查询持仓失败: {e}")
+            return self.held_qty # 如果查询失败，暂时返回旧值
+
+    def _check_order_via_rest(self):
+        """[新增] 使用 REST API 检查当前挂单状态"""
+        if not self.active_order_id:
+            return
+
+        try:
+            # 获取当前所有挂单
+            open_orders = self.rest.get_open_orders(self.symbol)
+            
+            # 检查我们的 active_order_id 是否在挂单列表中
+            is_open = False
+            if isinstance(open_orders, list):
+                for o in open_orders:
+                    if str(o.get('id')) == str(self.active_order_id):
+                        is_open = True
+                        break
+            
+            if is_open:
+                # 订单还在挂着，什么都不用做 (或者在这里处理超时逻辑)
+                pass
+            else:
+                # 订单不见了！说明要么成交了，要么被取消了
+                logger.info(f"🔍 订单 {self.active_order_id} 已不在挂单列表，更新状态...")
+                
+                # 1. 立即同步真实持仓
+                real_qty = self._get_real_position()
+                
+                # 2. 判断发生了什么
+                if self.active_order_side == 'Bid':
+                    if real_qty > self.held_qty:
+                        logger.info(f"✅ 买单成交 (持仓 {self.held_qty} -> {real_qty})")
+                        self.held_qty = real_qty
+                        # 简单估算成本 (REST轮询无法获取精确成交均价，暂用挂单价代替)
+                        self.avg_cost = self.active_order_price 
+                        self.hold_start_time = time.time()
+                        self.state = "SELLING"
+                    else:
+                        logger.info("❌ 买单被取消 (持仓未增加)")
+                        self.state = "IDLE"
+
+                elif self.active_order_side == 'Ask':
+                    if real_qty < self.held_qty:
+                        logger.info(f"✅ 卖单成交 (持仓 {self.held_qty} -> {real_qty})")
+                        # 简单的盈亏记录
+                        pnl = (self.active_order_price - self.avg_cost) * (self.held_qty - real_qty)
+                        logger.info(f"💰 估算盈亏: {pnl:.4f} USDC")
+                        
+                        self.held_qty = real_qty
+                        if self.held_qty < self.min_qty:
+                            self.state = "IDLE"
+                            self.held_qty = 0
+                    else:
+                        logger.info("❌ 卖单被取消 (持仓未减少)")
+                        # 保持 SELLING 状态，主循环会重试
+                
+                # 3. 清理 ID
+                self.active_order_id = None
+                self.active_order_side = None
+
+        except Exception as e:
+            logger.error(f"REST 检查订单失败: {e}")
+            
     def on_order_update(self, data):
         # 如果策略未正式激活（处于清仓阶段），忽略所有订单推送
         if not self.strategy_active:
