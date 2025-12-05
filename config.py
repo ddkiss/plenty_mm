@@ -20,6 +20,8 @@ class Config:
     # [新增] 超时止损时间 (秒)
     # 这里会优先读取 .env 中的 STOP_LOSS_TIMEOUT，如果没填则默认为 120
     STOP_LOSS_TIMEOUT = int(os.getenv("STOP_LOSS_TIMEOUT", "120"))
+    # Taker 费率 (0.012% = 0.00012)
+    TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.00012"))
 
     if not API_KEY or not SECRET_KEY:
         raise ValueError("请在 .env 文件中配置 API_KEY 和 SECRET_KEY")
