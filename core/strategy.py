@@ -478,14 +478,15 @@ class TickScalper:
         self.running = True
         
         self.cancel_all()
-        self.clear_open_positions() #  市价清仓
-
-        # [新增] 等待清仓订单的成交回报处理完毕，避免计入统计
-        logger.info("等待清仓完成...")
-        time.sleep(2)
-        # [新增] 标记策略正式激活，开始记录统计
-        self.strategy_active = True
         
+        # 初始同步一次持仓
+        self.held_qty = self._get_real_position() 
+        if self.held_qty > self.min_qty:
+            logger.info(f"发现初始持仓: {self.held_qty}，进入卖出模式")
+            self.state = "SELLING"
+            self.avg_cost = self.ws.best_bid # 丢失成本价，暂用当前价代替
+            
+        self.strategy_active = True
         logger.info(f"策略启动: {self.symbol} | 资金利用比例: {self.cfg.BALANCE_PCT} | 止损: {self.cfg.STOP_LOSS_PCT*100}%")
 
         while self.running:
