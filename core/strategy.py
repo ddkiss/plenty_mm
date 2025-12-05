@@ -435,6 +435,7 @@ class TickScalper:
             logger.info(f"发现初始持仓: {self.held_qty}，进入卖出模式")
             self.state = "SELLING"
             self.avg_cost = self.ws.best_bid
+            self.hold_start_time = time.time()
             
         self.strategy_active = True
         logger.info(f"策略启动: {self.symbol} | 资金利用比例: {self.cfg.BALANCE_PCT} | 止损: {self.cfg.STOP_LOSS_PCT*100}%")
