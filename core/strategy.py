@@ -273,6 +273,8 @@ class TickScalper:
         if self.active_order_id:
             try:
                 self.rest.cancel_open_orders(self.symbol)
+                # 同步余额
+                self._sync_position_state()
             except Exception as e:
                 logger.error(f"撤单失败: {e}")
         self.active_order_id = None
