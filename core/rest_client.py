@@ -59,6 +59,29 @@ class BackpackREST:
     def get_markets(self):
         return requests.get(f"{self.base_url}/api/v1/markets").json()
 
+    # 获取深度数据
+    def get_depth(self, symbol, limit=5):
+        """
+        获取盘口深度
+        limit: 限制返回的档位数量，默认为5 (获取最优买卖价只需看第1档，设为5最节省流量)
+        """
+        try:
+            url = f"{self.base_url}/api/v1/depth"
+            params = {
+                "symbol": symbol, 
+                "limit": str(limit)
+            }
+            # 深度接口通常是公共的，直接请求即可，不需要签名
+            resp = requests.get(url, params=params, timeout=2)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                logger.warning(f"获取深度失败 [{resp.status_code}]: {resp.text}")
+                return None
+        except Exception as e:
+            logger.error(f"获取深度网络异常: {e}")
+            return None
+
     def execute_order(self, order_data):
         return self._request("POST", "/api/v1/order", "orderExecute", data=order_data)
 
