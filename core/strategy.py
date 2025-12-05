@@ -428,7 +428,7 @@ class TickScalper:
         if self.held_qty > self.min_qty:
             logger.info(f"发现初始持仓: {self.held_qty}，进入卖出模式")
             self.state = "SELLING"
-            self.avg_cost = self.ws.best_bid
+            self.avg_cost = 0.0
             self.hold_start_time = time.time()
             
         self.strategy_active = True
