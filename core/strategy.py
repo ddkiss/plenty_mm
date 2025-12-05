@@ -9,7 +9,7 @@ class TickScalper:
     def __init__(self, config):
         self.cfg = config
         self.symbol = config.SYMBOL
-        # [新增] 记录挂单产生的时间
+        # 记录挂单产生的时间
         self.active_order_time = 0
         
         # Clients
