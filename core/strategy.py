@@ -437,43 +437,42 @@ class TickScalper:
         while self.running:
             time.sleep(0.5)
 
-            # 核心检查逻辑
-            self._check_order_via_rest()
-            
-            # 1. 冷却
-            if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
-                continue
-
-            # 4. [新增] 获取最新行情 (Depth)
-                # limit=5 对应截图中的参数，减少数据传输量
-                depth = self.rest.get_depth(self.symbol, limit=5)
+            try:
+                self._check_order_via_rest()
                 
-                if not depth:
+                if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
+                    logger.warning("盘口数据为空")
                     continue
+
+                # 获取深度 (limit=5)
+                depth = self.rest.get_depth(self.symbol, limit=5)
+                if not depth: continue
                 
-                # 解析 API 数据
-                # 文档格式: "bids": [["price", "qty"], ...], "asks": [...]
+                # 数据源是字符串列表: [['20.12', '1.5'], ...]
                 bids = depth.get("bids", [])
                 asks = depth.get("asks", [])
 
                 if not bids or not asks:
-                    logger.warning("盘口数据为空")
                     continue
                 
-                # 获取最优买价 (Best Bid): 买单中价格最高的
+                # --- [修正开始] 稳健的 BBO 获取逻辑 ---
+                
+                # 1. 获取最优买价 (Best Bid): 买单中价格最高的
                 # key=lambda x: float(x[0]) 表示按价格数值大小比较
                 best_bid_order = max(bids, key=lambda x: float(x[0]))
                 best_bid = float(best_bid_order[0])
 
-                # 获取最优卖价 (Best Ask): 卖单中价格最低的
+                # 2. 获取最优卖价 (Best Ask): 卖单中价格最低的
                 best_ask_order = min(asks, key=lambda x: float(x[0]))
                 best_ask = float(best_ask_order[0])
                 
+                # --- [修正结束] ---
+
                 # 如果是 SELLING 状态且成本未初始化，用当前买一价初始化
                 if self.state == "SELLING" and self.avg_cost == 0:
                     self.avg_cost = best_bid
 
-                #  执行策略逻辑 (传入最新的 bid/ask)
+                # 执行策略
                 if self.state == "IDLE":
                     self._logic_buy(best_bid, best_ask)
                 elif self.state == "BUYING":
@@ -483,7 +482,7 @@ class TickScalper:
 
             except Exception as e:
                 logger.error(f"主循环发生错误: {e}")
-                time.sleep(1) # 出错后多休息一下
+                time.sleep(1)
 
     def _place_order(self, side, price, qty, post_only=True):
         price = round_to_step(price, self.tick_size)
