@@ -264,7 +264,7 @@ class TickScalper:
             f"累计手续费: {self.stats['total_fee']:.4f} USDC\n"
             f"净利润:   {net_pnl:.4f} USDC\n"
             f"磨损率:   {wear_rate:.5f}%\n"
-            f"{'='*5} {current_time_str} (UTC+8){'='*2} \n"
+            f"{'='*5} {current_time_str} (UTC+8) {'='*3} \n"
         )
         logger.info(msg)
 
