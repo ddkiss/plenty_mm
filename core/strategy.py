@@ -173,14 +173,26 @@ class TickScalper:
                 if filled_qty > 0:
                     trade_val = filled_qty * self.active_order_price # 成交额
                     
-                    # 1. 累加基础统计
+                    # --- [修改开始] 完善统计逻辑 ---
                     self.stats['total_quote_vol'] += trade_val
+                    
+                    # 区分买卖方向
                     if self.active_order_side == 'Bid':
                         self.stats['total_buy_qty'] += filled_qty
+                        # 区分 Maker/Taker
+                        if self.active_order_is_maker:
+                            self.stats['maker_buy_qty'] += filled_qty
+                        else:
+                            self.stats['taker_buy_qty'] += filled_qty
                     else:
                         self.stats['total_sell_qty'] += filled_qty
+                        # 区分 Maker/Taker
+                        if self.active_order_is_maker:
+                            self.stats['maker_sell_qty'] += filled_qty
+                        else:
+                            self.stats['taker_sell_qty'] += filled_qty
                     
-                    # 2. 如果是 Taker 单，专门累加到 Taker 成交额中
+                    # 累加 Taker 成交额 (用于算费率)
                     if not self.active_order_is_maker:
                         self.stats['taker_quote_vol'] += trade_val
                 
