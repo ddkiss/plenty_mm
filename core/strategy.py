@@ -443,6 +443,14 @@ class TickScalper:
                 self.cancel_all()
                 return
 
+            # 计算当前浮动盈亏
+            current_pnl_pct = (best_bid - self.avg_cost) / self.avg_cost            
+            # 检查是否在挂单期间跌破止损线
+            if current_pnl_pct < -self.cfg.STOP_LOSS_PCT:
+                logger.warning(f"🚨 挂单期间触发价格止损 (PnL: {current_pnl_pct*100:.2f}%) -> 撤单准备止损")
+                self.cancel_all()
+                return
+            
             if (time.time() - self.hold_start_time > self.cfg.STOP_LOSS_TIMEOUT):
                  if abs(self.active_order_price - best_ask) > self.tick_size / 2:
                     logger.info("超时追单调整...")
