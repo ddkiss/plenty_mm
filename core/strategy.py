@@ -3,7 +3,6 @@ import threading
 from datetime import datetime, timedelta
 from .utils import logger, round_to_step, floor_to
 from .rest_client import BackpackREST
-from .ws_client import BackpackWS
 
 class TickScalper:
     def __init__(self, config):
@@ -14,7 +13,7 @@ class TickScalper:
         
         # Clients
         self.rest = BackpackREST(config.API_KEY, config.SECRET_KEY)
-        self.ws = BackpackWS(config.API_KEY, config.SECRET_KEY, self.symbol, self.on_order_update)
+        
         
         # State
         self.state = "IDLE"  # IDLE, BUYING, SELLING
@@ -251,9 +250,6 @@ class TickScalper:
         except Exception as e:
             logger.error(f"REST 检查订单失败: {e}")
             
-    def on_order_update(self, data):
-        # REST 模式下忽略所有 WS 订单推送
-        pass
 
     def _print_stats(self):
         """打印详细的统计报表"""
@@ -423,11 +419,9 @@ class TickScalper:
 
     def run(self):
         self.init_market_info()
-        self.ws.connect()
         self.running = True
         
         self.cancel_all()
-        
         # 初始同步一次持仓
         self._sync_position_state() # <--- 这里直接调用同步方法
         
@@ -450,18 +444,41 @@ class TickScalper:
             if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
                 continue
 
-            # 2. 行情
-            bid = self.ws.best_bid
-            ask = self.ws.best_ask
-            if bid == 0 or ask == 0: continue
+            # 4. [新增] 获取最新行情 (Depth)
+                # limit=5 对应截图中的参数，减少数据传输量
+                depth = self.rest.get_depth(self.symbol, limit=5)
+                
+                if not depth:
+                    continue
+                
+                # 解析 API 数据
+                # 文档格式: "bids": [["price", "qty"], ...], "asks": [...]
+                bids = depth.get("bids", [])
+                asks = depth.get("asks", [])
 
-            # 3. 状态机
-            if self.state == "IDLE":
-                self._logic_buy(bid, ask)
-            elif self.state == "BUYING":
-                self._logic_chase_buy(bid)
-            elif self.state == "SELLING":
-                self._logic_sell(bid, ask)
+                if not bids or not asks:
+                    logger.warning("盘口数据为空")
+                    continue
+                
+                # 获取买一和卖一 (列表的第一个元素是价格)
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
+                
+                # 如果是 SELLING 状态且成本未初始化，用当前买一价初始化
+                if self.state == "SELLING" and self.avg_cost == 0:
+                    self.avg_cost = best_bid
+
+                # 5. 执行策略逻辑 (传入最新的 bid/ask)
+                if self.state == "IDLE":
+                    self._logic_buy(best_bid, best_ask)
+                elif self.state == "BUYING":
+                    self._logic_chase_buy(best_bid)
+                elif self.state == "SELLING":
+                    self._logic_sell(best_bid, best_ask)
+
+            except Exception as e:
+                logger.error(f"主循环发生错误: {e}")
+                time.sleep(1) # 出错后多休息一下
 
     def _place_order(self, side, price, qty, post_only=True):
         price = round_to_step(price, self.tick_size)
