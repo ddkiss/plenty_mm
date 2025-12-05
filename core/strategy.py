@@ -1,4 +1,4 @@
-Fimport time
+import time
 import threading
 from datetime import datetime, timedelta
 from .utils import logger, round_to_step, floor_to
