@@ -27,6 +27,8 @@ class TickScalper:
         self.active_order_id = None
         self.active_order_price = 0.0
         self.active_order_side = None 
+        # 标记当前挂单是否为 Maker
+        self.active_order_is_maker = False
         
         # Position Tracking
         self.held_qty = 0.0
