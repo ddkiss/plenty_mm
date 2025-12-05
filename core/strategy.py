@@ -1,6 +1,6 @@
 import time
 import threading
-from datetime import timedelta
+from datetime import datetime, timedelta
 from .utils import logger, round_to_step, floor_to
 from .rest_client import BackpackREST
 from .ws_client import BackpackWS
@@ -247,9 +247,13 @@ class TickScalper:
         maker_ratio = (maker_vol / total_vol * 100) if total_vol > 0 else 0
         
         run_time_str = str(timedelta(seconds=int(duration)))
+
+        # 获取东八区时间 (UTC时间 + 8小时)
+        beijing_now = datetime.utcnow() + timedelta(hours=8)
+        current_time_str = beijing_now.strftime('%m-%d %H:%M:%S')
         
         msg = (
-            f"\n{'='*2} {self.symbol} 统计汇总 {'='*4}\n"
+            f"\n{'='*3} {self.symbol} 统计汇总 {'='*3}\n"
             f"运行时间: {run_time_str}\n"
             f"总成交量: {total_vol:.4f} (买 {self.stats['total_buy_qty']:.4f} | 卖 {self.stats['total_sell_qty']:.4f})\n"
             f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"
@@ -260,7 +264,7 @@ class TickScalper:
             f"累计手续费: {self.stats['total_fee']:.4f} USDC\n"
             f"净利润:   {net_pnl:.4f} USDC\n"
             f"磨损率:   {wear_rate:.5f}%\n"
-            f"{'='*10}\n"
+            f"{'='*5} {current_time_str} (UTC+8){'='*2} \n"
         )
         logger.info(msg)
 
