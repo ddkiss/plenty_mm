@@ -460,15 +460,20 @@ class TickScalper:
                     logger.warning("盘口数据为空")
                     continue
                 
-                # 获取买一和卖一 (列表的第一个元素是价格)
-                best_bid = float(bids[0][0])
-                best_ask = float(asks[0][0])
+                # 获取最优买价 (Best Bid): 买单中价格最高的
+                # key=lambda x: float(x[0]) 表示按价格数值大小比较
+                best_bid_order = max(bids, key=lambda x: float(x[0]))
+                best_bid = float(best_bid_order[0])
+
+                # 获取最优卖价 (Best Ask): 卖单中价格最低的
+                best_ask_order = min(asks, key=lambda x: float(x[0]))
+                best_ask = float(best_ask_order[0])
                 
                 # 如果是 SELLING 状态且成本未初始化，用当前买一价初始化
                 if self.state == "SELLING" and self.avg_cost == 0:
                     self.avg_cost = best_bid
 
-                # 5. 执行策略逻辑 (传入最新的 bid/ask)
+                #  执行策略逻辑 (传入最新的 bid/ask)
                 if self.state == "IDLE":
                     self._logic_buy(best_bid, best_ask)
                 elif self.state == "BUYING":
