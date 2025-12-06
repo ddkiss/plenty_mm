@@ -328,6 +328,7 @@ class TickScalper:
                             self.stats['maker_buy_qty'] += filled_qty
                         else:
                             self.stats['taker_buy_qty'] += filled_qty
+
                     else:
                         # 卖单撤单成交：需要计算盈亏 [修复重点]
                         self.stats['total_sell_qty'] += filled_qty
@@ -491,6 +492,7 @@ class TickScalper:
 
                 # 如果是 SELLING 状态且成本未初始化，用当前买一价初始化
                 if self.state == "SELLING" and self.avg_cost == 0:
+                    logger.warning(f"⚠️ 警告：检测到无成本持仓 (可能是重启或异常导致)！强制将成本重置为当前 Bid: {best_bid}")
                     self.avg_cost = best_bid
 
                 # 执行策略
