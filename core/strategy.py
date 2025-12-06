@@ -198,14 +198,31 @@ class TickScalper:
                 if self.active_order_side == 'Bid':
                     if real_qty > self.held_qty:
                         logger.info(f"✅ 买单成交 (持仓 {self.held_qty} -> {real_qty})")
+                        
+                        # === [修改重点] 计算加权平均成本 ===
+                        filled_qty = real_qty - self.held_qty
+                        # 新总成本 = (旧持仓 * 旧成本) + (新成交量 * 成交价)
+                        total_cost_val = (self.held_qty * self.avg_cost) + (filled_qty * self.active_order_price)
+                        new_avg_cost = total_cost_val / real_qty
+                        
+                        self.avg_cost = new_avg_cost
+                        logger.info(f"🔄 成本更新: {self.avg_cost:.5f} (DCA次数: {self.dca_count})")
+                        # ==================================
+
                         self.held_qty = real_qty
-                        # 简单估算成本
-                        self.avg_cost = self.active_order_price 
-                        self.hold_start_time = time.time()
-                        self.state = "SELLING"
+                        self.hold_start_time = time.time() # 补仓后是否重置时间看你喜好，通常建议重置
+                        
+                        # 如果是补仓单成交，增加计数
+                        if self.state == "SELLING": 
+                            self.dca_count += 1
+                        else:
+                            # 如果是初始买单，状态转为 SELLING
+                            self.state = "SELLING"
                     else:
                         logger.info("❌ 买单被取消 (持仓未增加)")
-                        self.state = "IDLE"
+                        # 注意：如果补仓单被取消，状态应该保持在 SELLING，不要重置为 IDLE
+                        if self.state != "SELLING":
+                            self.state = "IDLE"
 
                 elif self.active_order_side == 'Ask':
                     if real_qty < self.held_qty:
