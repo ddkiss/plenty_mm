@@ -166,6 +166,8 @@ class TickScalper:
                 
                 # [优化] 记录旧持仓，用于计算成交量
                 old_qty = self.held_qty
+                # 在同步前，先备份旧的成本！(防止清仓后成本归零)
+                old_avg_cost = self.avg_cost  
                 
                 # [核心修改] 直接调用同步方法，一次性更新 held_qty 和 avg_cost
                 # 这一步会从 API 拿到最新的 entryPrice，无需手动计算加权平均！
@@ -198,8 +200,6 @@ class TickScalper:
                     if self.held_qty > old_qty:
                         logger.info(f"✅ 买单成交 (持仓 {old_qty} -> {self.held_qty})")
                         
-                        # [删除] 这里原本复杂的加权平均计算代码全部删掉
-                        # 因为 _sync_position_state 已经把 self.avg_cost 更新为最新的 entryPrice 了
                         
                         logger.info(f"🔄 最新成本(API): {self.avg_cost:.5f} (DCA次数: {self.dca_count})")
                         
@@ -218,10 +218,11 @@ class TickScalper:
                     # 如果持仓减少了
                     if self.held_qty < old_qty:
                         logger.info(f"✅ 卖单成交 (持仓 {old_qty} -> {self.held_qty})")
-                        
+                        # 逻辑：如果备份的成本大于0就用备份的，否则(极罕见)用挂单价兜底
+                        cost_to_use = old_avg_cost if old_avg_cost > 0 else self.active_order_price
                         # 计算盈亏 (卖出价 - 成本) * 数量
                         # 注意：这里的成本用的是卖出前的成本，没问题
-                        trade_pnl = (self.active_order_price - self.avg_cost) * filled_qty
+                        trade_pnl = (self.active_order_price - cost_to_use) * filled_qty
                         self.stats['trade_count'] += 1
                         self.stats['total_pnl'] += trade_pnl
                         
@@ -303,6 +304,7 @@ class TickScalper:
                 self.rest.cancel_open_orders(self.symbol)
                 
                 old_qty = self.held_qty
+                old_avg_cost = self.avg_cost
                 # 同步最新持仓和成本 (API entryPrice)
                 self._sync_position_state()
                 
@@ -334,8 +336,9 @@ class TickScalper:
                         self.stats['total_sell_qty'] += filled_qty
                         if self.active_order_is_maker: self.stats['maker_sell_qty'] += filled_qty
                         else: self.stats['taker_sell_qty'] += filled_qty
-                        
-                        trade_pnl = (self.active_order_price - self.avg_cost) * filled_qty
+
+                        cost_to_use = old_avg_cost if old_avg_cost > 0 else self.active_order_price
+                        trade_pnl = (self.active_order_price - cost_to_use) * filled_qty
                         self.stats['total_pnl'] += trade_pnl
                         
                         fee_rate = 0 if self.active_order_is_maker else self.cfg.TAKER_FEE_RATE
