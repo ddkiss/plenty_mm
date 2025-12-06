@@ -201,7 +201,6 @@ class TickScalper:
                     if self.held_qty > old_qty:
                         logger.info(f"✅ 买单成交 (持仓 {old_qty} -> {self.held_qty})")
                         self.last_buy_price = self.active_order_price 
-                        logger.info(f"🔄 最新成本(API): {self.avg_cost:.5f} (DCA次数: {self.dca_count})")
                         
                         self.hold_start_time = time.time()
                         
@@ -209,6 +208,8 @@ class TickScalper:
                             self.dca_count += 1
                         else:
                             self.state = "SELLING"
+                        logger.info(f"🔄 最新成本(API): {self.avg_cost:.5f} (DCA次数: {self.dca_count})")
+                        
                     else:
                         logger.info("❌ 买单被取消 (持仓未增加)")
                         if self.state != "SELLING":
