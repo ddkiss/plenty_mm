@@ -159,106 +159,90 @@ class TickScalper:
                         break
             
             if is_open:
-                # 订单还在挂着
-                pass
+                pass # 订单还在挂着
             else:
                 # 订单不见了！说明要么成交了，要么被取消了
                 logger.info(f"🔍 订单 {self.active_order_id} 已不在挂单列表，更新状态...")
                 
-                # 1. 立即同步真实持仓
-                real_qty = self._get_real_position()
-
-                #  统一计算成交数据
-                filled_qty = abs(real_qty - self.held_qty)
+                # [优化] 记录旧持仓，用于计算成交量
+                old_qty = self.held_qty
+                
+                # [核心修改] 直接调用同步方法，一次性更新 held_qty 和 avg_cost
+                # 这一步会从 API 拿到最新的 entryPrice，无需手动计算加权平均！
+                self._sync_position_state()
+                
+                # 计算成交量
+                filled_qty = abs(self.held_qty - old_qty)
                 
                 if filled_qty > 0:
-                    trade_val = filled_qty * self.active_order_price # 成交额
+                    trade_val = filled_qty * self.active_order_price
                     
-                    # --- [修改开始] 完善统计逻辑 ---
+                    # --- 更新统计数据 ---
                     self.stats['total_quote_vol'] += trade_val
                     
                     if self.active_order_side == 'Bid':
                         self.stats['total_buy_qty'] += filled_qty
-                        if self.active_order_is_maker:
-                            self.stats['maker_buy_qty'] += filled_qty
-                        else:
-                            self.stats['taker_buy_qty'] += filled_qty
+                        if self.active_order_is_maker: self.stats['maker_buy_qty'] += filled_qty
+                        else: self.stats['taker_buy_qty'] += filled_qty
                     else:
                         self.stats['total_sell_qty'] += filled_qty
-                        if self.active_order_is_maker:
-                            self.stats['maker_sell_qty'] += filled_qty
-                        else:
-                            self.stats['taker_sell_qty'] += filled_qty
+                        if self.active_order_is_maker: self.stats['maker_sell_qty'] += filled_qty
+                        else: self.stats['taker_sell_qty'] += filled_qty
                     
                     if not self.active_order_is_maker:
                         self.stats['taker_quote_vol'] += trade_val
                 
-                # 2. 判断发生了什么
+                # 判断发生了什么
                 if self.active_order_side == 'Bid':
-                    if real_qty > self.held_qty:
-                        logger.info(f"✅ 买单成交 (持仓 {self.held_qty} -> {real_qty})")
+                    # 如果持仓增加了
+                    if self.held_qty > old_qty:
+                        logger.info(f"✅ 买单成交 (持仓 {old_qty} -> {self.held_qty})")
                         
-                        # === [修改重点] 计算加权平均成本 ===
-                        filled_qty = real_qty - self.held_qty
-                        # 新总成本 = (旧持仓 * 旧成本) + (新成交量 * 成交价)
-                        total_cost_val = (self.held_qty * self.avg_cost) + (filled_qty * self.active_order_price)
-                        new_avg_cost = total_cost_val / real_qty
+                        # [删除] 这里原本复杂的加权平均计算代码全部删掉
+                        # 因为 _sync_position_state 已经把 self.avg_cost 更新为最新的 entryPrice 了
                         
-                        self.avg_cost = new_avg_cost
-                        logger.info(f"🔄 成本更新: {self.avg_cost:.5f} (DCA次数: {self.dca_count})")
-                        # ==================================
-
-                        self.held_qty = real_qty
-                        self.hold_start_time = time.time() # 补仓后是否重置时间看你喜好，通常建议重置
+                        logger.info(f"🔄 最新成本(API): {self.avg_cost:.5f} (DCA次数: {self.dca_count})")
                         
-                        # 如果是补仓单成交，增加计数
+                        self.hold_start_time = time.time()
+                        
                         if self.state == "SELLING": 
                             self.dca_count += 1
                         else:
-                            # 如果是初始买单，状态转为 SELLING
                             self.state = "SELLING"
                     else:
                         logger.info("❌ 买单被取消 (持仓未增加)")
-                        # 注意：如果补仓单被取消，状态应该保持在 SELLING，不要重置为 IDLE
                         if self.state != "SELLING":
                             self.state = "IDLE"
 
                 elif self.active_order_side == 'Ask':
-                    if real_qty < self.held_qty:
-                        logger.info(f"✅ 卖单成交 (持仓 {self.held_qty} -> {real_qty})")
+                    # 如果持仓减少了
+                    if self.held_qty < old_qty:
+                        logger.info(f"✅ 卖单成交 (持仓 {old_qty} -> {self.held_qty})")
                         
-                        trade_pnl = (self.active_order_price - self.avg_cost) * (self.held_qty - real_qty)
+                        # 计算盈亏 (卖出价 - 成本) * 数量
+                        # 注意：这里的成本用的是卖出前的成本，没问题
+                        trade_pnl = (self.active_order_price - self.avg_cost) * filled_qty
                         self.stats['trade_count'] += 1
                         self.stats['total_pnl'] += trade_pnl
                         
-                        # [新增修复] 计算净利润用于止损判断
-                        trade_val_sell = self.active_order_price * (self.held_qty - real_qty)
-                        # 如果是 Maker 假定0费率，否则使用配置的 Taker 费率
+                        trade_val_sell = self.active_order_price * filled_qty
                         fee_rate = 0 if self.active_order_is_maker else self.cfg.TAKER_FEE_RATE
                         net_pnl = trade_pnl - (trade_val_sell * fee_rate)
 
-                        self.held_qty = real_qty
                         if self.held_qty < self.min_qty:
                             self.state = "IDLE"
                             self.held_qty = 0
                             
-                            
-                            # [修改] 使用净利润 net_pnl 判断是否亏损
-                            
                             if net_pnl < 0:
-                                # [修改] 不再重置，而是累加到总统计中
                                 self.stats['stop_loss_count'] += 1
                                 self.last_cool_down = time.time()
                                 self.current_cool_down_time = self.cfg.COOL_DOWN 
-                                # [日志优化] 显示总止损次数
-                                logger.warning(f"🛑 触发硬止损！累计止损次数: {self.stats['stop_loss_count']} | 执行冷却 {self.cfg.COOL_DOWN}s")                      
+                                logger.warning(f"🛑 触发硬止损！累计止损: {self.stats['stop_loss_count']} | 冷却 {self.cfg.COOL_DOWN}s")                      
                                 
                             self._print_stats()
-
                     else:
                         logger.info("❌ 卖单被取消 (持仓未减少)")
                 
-                # 3. 清理 ID
                 self.active_order_id = None
                 self.active_order_side = None
 
@@ -317,73 +301,54 @@ class TickScalper:
         if self.active_order_id:
             try:
                 self.rest.cancel_open_orders(self.symbol)
-                # [新增] 记录撤单前的持仓，用于计算部分成交
+                
                 old_qty = self.held_qty
-                # 同步余额
+                # 同步最新持仓和成本 (API entryPrice)
                 self._sync_position_state()
-                #  补算撤单期间产生的成交量
+                
                 filled_qty = abs(self.held_qty - old_qty)
                 
                 if filled_qty > 0:
                     trade_val = filled_qty * self.active_order_price
-                    
-                    # --- [修改开始] 完善统计逻辑 ---
                     self.stats['total_quote_vol'] += trade_val
                     
                     # 区分买卖方向
                     if self.active_order_side == 'Bid':
                         self.stats['total_buy_qty'] += filled_qty
-                        if self.active_order_is_maker:
-                            self.stats['maker_buy_qty'] += filled_qty
-                        else:
-                            self.stats['taker_buy_qty'] += filled_qty
+                        if self.active_order_is_maker: self.stats['maker_buy_qty'] += filled_qty
+                        else: self.stats['taker_buy_qty'] += filled_qty
                         
-                        # === [修改重点] 撤单时的加权平均逻辑 ===
+                        # [删除] 之前这里的一大段手动加权平均计算代码全部删掉
+                        # [新增] 仅做日志记录
                         if self.held_qty > 0:
-                            # 注意：cancel_all 里的 self.held_qty 已经是 _sync_position_state 后的最新持仓(old_qty + filled)
-                            # 而 old_qty 是撤单前的持仓
-                            
-                            # 如果 old_qty 为 0，说明是底仓刚买入 -> 成本 = 挂单价
-                            if old_qty == 0:
-                                self.avg_cost = self.active_order_price
-                            else:
-                                # 说明是补仓部分成交 -> 加权平均
-                                total_val = (old_qty * self.avg_cost) + (filled_qty * self.active_order_price)
-                                self.avg_cost = total_val / self.held_qty
-                                self.dca_count += 1 # 既然有成交，就算一次补仓
-                            
-                            logger.info(f"✅ 撤买单成交，更新加权成本: {self.avg_cost:.5f}")
+                            # 既然有成交，且是补仓/买入，DCA计数加1
+                            # 注意：如果是底仓成交，dca_count 本来就是0，这里加1不太对？
+                            # 修正逻辑：如果是补仓(SELLING状态下买入)，才加计数。
+                            if self.state == "SELLING":
+                                self.dca_count += 1
+                                
+                            logger.info(f"✅ 撤买单成交，API已更新成本: {self.avg_cost:.5f}")
 
                     else:
-                        # 卖单撤单成交：需要计算盈亏 [修复重点]
+                        # 卖单撤单成交：逻辑保持不变
                         self.stats['total_sell_qty'] += filled_qty
-                        if self.active_order_is_maker:
-                            self.stats['maker_sell_qty'] += filled_qty
-                        else:
-                            self.stats['taker_sell_qty'] += filled_qty
+                        if self.active_order_is_maker: self.stats['maker_sell_qty'] += filled_qty
+                        else: self.stats['taker_sell_qty'] += filled_qty
                         
-                        # [新增修复] 计算这部分成交的盈亏
                         trade_pnl = (self.active_order_price - self.avg_cost) * filled_qty
                         self.stats['total_pnl'] += trade_pnl
                         
-                        # [新增修复] 计算净利并更新连续亏损计数
-                        # 估算手续费 (保守按 Taker 算，或者根据 active_order_is_maker 判断)
                         fee_rate = 0 if self.active_order_is_maker else self.cfg.TAKER_FEE_RATE
                         net_pnl = trade_pnl - (trade_val * fee_rate)
                         
                         if net_pnl < 0:
-                            # [修改] 累加到总统计
                             self.stats['stop_loss_count'] += 1
-                            
                             self.last_cool_down = time.time()
                             self.current_cool_down_time = self.cfg.COOL_DOWN 
-                            logger.warning(f"📉 撤单止损！累计止损次数: {self.stats['stop_loss_count']} | 执行冷却 {self.cfg.COOL_DOWN}s")
-                      
+                            logger.warning(f"📉 撤单止损！累计止损: {self.stats['stop_loss_count']} | 冷却 {self.cfg.COOL_DOWN}s")
                     
-                    # 累加 Taker 成交额 (用于算费率)
                     if not self.active_order_is_maker:
                         self.stats['taker_quote_vol'] += trade_val
-                    # --- [修改结束] ---
                     
                     logger.info(f"📉 撤单发现部分成交: {filled_qty}")
             except Exception as e:
