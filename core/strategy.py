@@ -225,8 +225,8 @@ class TickScalper:
                             self.held_qty = 0
                             # [新增/迁移] 连续亏损冷却逻辑
                             if trade_pnl < 0:
-                            self.consecutive_loss_count += 1
-                            logger.warning(f"📉 本次亏损，连续亏损计数: {self.consecutive_loss_count}")
+                                self.consecutive_loss_count += 1
+                                logger.warning(f"📉 本次亏损，连续亏损计数: {self.consecutive_loss_count}")
                             
                             if self.consecutive_loss_count == 1:
                                 # [新增] 第一次止损：设置较短的 5秒 冷却
