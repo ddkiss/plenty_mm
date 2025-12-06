@@ -19,8 +19,6 @@ class TickScalper:
         self.state = "IDLE"  # IDLE, BUYING, SELLING
         # 策略激活状态标记，用于过滤启动时的清仓数据
         self.strategy_active = False
-        # 连续亏损计数器
-        self.consecutive_loss_count = 0
         # 当前补仓次数计数器
         self.dca_count = 0
         
@@ -61,7 +59,8 @@ class TickScalper:
             'taker_quote_vol': 0.0,  # [新增] Taker 总成交额 (USDC)
             'total_pnl': 0.0,        # 累计盈亏 (扣除手续费前)
             'total_fee': 0.0,        # 累计手续费
-            'trade_count': 0         # 成交次数
+            'trade_count': 0,         # 成交次数
+            'stop_loss_count': 0
         }
 
     def init_market_info(self):
@@ -247,11 +246,12 @@ class TickScalper:
                             # [修改] 使用净利润 net_pnl 判断是否亏损
                             
                             if net_pnl < 0:
-                                self.consecutive_loss_count += 1
-                                # DCA 模式下，一旦止损就是大伤，直接长冷却
+                                # [修改] 不再重置，而是累加到总统计中
+                                self.stats['stop_loss_count'] += 1
                                 self.last_cool_down = time.time()
                                 self.current_cool_down_time = self.cfg.COOL_DOWN 
-                                logger.warning(f"🛑 止损/亏损触发，执行长冷却 {self.cfg.COOL_DOWN}s")                                
+                                # [日志优化] 显示总止损次数
+                                logger.warning(f"🛑 触发硬止损！累计止损次数: {self.stats['stop_loss_count']} | 执行冷却 {self.cfg.COOL_DOWN}s")                      
                                 
                             self._print_stats()
 
@@ -302,7 +302,7 @@ class TickScalper:
             f"总成交量: {total_vol:.4f} (买 {self.stats['total_buy_qty']:.4f} | 卖 {self.stats['total_sell_qty']:.4f})\n"
             f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"
             f"Maker总量: {maker_vol:.4f} ({maker_ratio:.1f}%)\n"
-            f"Taker总量: {(total_vol - maker_vol):.4f}\n"
+            f"Taker总量: {(total_vol - maker_vol):.4f} | 止损： {self.stats['stop_loss_count']} 次\n"
             f"----------------------------------------\n"
             f"累计毛利: {self.stats['total_pnl']:.4f} USDC\n"
             f"累计手续费: {self.stats['total_fee']:.4f} USDC\n"
@@ -372,12 +372,13 @@ class TickScalper:
                         net_pnl = trade_pnl - (trade_val * fee_rate)
                         
                         if net_pnl < 0:
-                            self.consecutive_loss_count += 1
+                            # [修改] 累加到总统计
+                            self.stats['stop_loss_count'] += 1
+                            
                             self.last_cool_down = time.time()
                             self.current_cool_down_time = self.cfg.COOL_DOWN 
-                            logger.warning(f"📉 撤单发现亏损成交，执行长冷却 {self.cfg.COOL_DOWN}s")
-                        else:
-                            self.consecutive_loss_count = 0
+                            logger.warning(f"📉 撤单止损！累计止损次数: {self.stats['stop_loss_count']} | 执行冷却 {self.cfg.COOL_DOWN}s")
+                      
                     
                     # 累加 Taker 成交额 (用于算费率)
                     if not self.active_order_is_maker:
