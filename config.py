@@ -13,14 +13,14 @@ class Config:
     WS_URL = "wss://ws.backpack.exchange"
     
     # Strategy Settings
+    BALANCE_PCT = float(os.getenv("BALANCE_PCT", "0.3"))
+    STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.02"))
+    STOP_LOSS_TIMEOUT = int(os.getenv("STOP_LOSS_TIMEOUT", "1800"))
+    MAX_DCA_COUNT = int(os.getenv("MAX_DCA_COUNT", "2"))
+    DCA_DROP_PCT = float(os.getenv("DCA_DROP_PCT", "0.008"))
+    DCA_MULTIPLIER = float(os.getenv("DCA_MULTIPLIER", "1.0"))
     LEVERAGE = float(os.getenv("LEVERAGE", "1.0"))
-    BALANCE_PCT = float(os.getenv("BALANCE_PCT", "0.8"))
-    STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.01"))
     COOL_DOWN = int(os.getenv("COOL_DOWN", "180"))
-    # [新增] 超时止损时间 (秒)
-    # 这里会优先读取 .env 中的 STOP_LOSS_TIMEOUT，如果没填则默认为 120
-    STOP_LOSS_TIMEOUT = int(os.getenv("STOP_LOSS_TIMEOUT", "600"))
-    # Taker 费率 (0.012% = 0.00012)
     TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.00018"))
 
     if not API_KEY or not SECRET_KEY:
