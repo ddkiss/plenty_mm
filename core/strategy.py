@@ -441,7 +441,6 @@ class TickScalper:
                 self._check_order_via_rest()
                 
                 if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
-                    
                     continue
 
                 # 获取深度 (limit=5)
