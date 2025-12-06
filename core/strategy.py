@@ -243,25 +243,15 @@ class TickScalper:
                             self.state = "IDLE"
                             self.held_qty = 0
                             
+                            
                             # [修改] 使用净利润 net_pnl 判断是否亏损
+                            
                             if net_pnl < 0:
                                 self.consecutive_loss_count += 1
-                                logger.warning(f"📉 本次净亏损(含费)，连续亏损计数: {self.consecutive_loss_count}")
-                            
-                            if self.consecutive_loss_count == 1:
+                                # DCA 模式下，一旦止损就是大伤，直接长冷却
                                 self.last_cool_down = time.time()
-                                self.current_cool_down_time = 5 
-                                logger.warning(f"🛑 首次止损，触发短冷却 5s")
-                                
-                            elif self.consecutive_loss_count >= 2:
-                                self.last_cool_down = time.time()
-                                self.current_cool_down_time = self.cfg.COOL_DOWN
-                                logger.warning(f"🛑 连续止损达标(2次)，触发长冷却 {self.cfg.COOL_DOWN}s")
-                                self.consecutive_loss_count = 0 
-                            else:
-                                if self.consecutive_loss_count > 0:
-                                    logger.info("✅ 本次盈利，连续亏损计数重置")
-                                self.consecutive_loss_count = 0
+                                self.current_cool_down_time = self.cfg.COOL_DOWN 
+                                logger.warning(f"🛑 止损/亏损触发，执行长冷却 {self.cfg.COOL_DOWN}s")                                
                                 
                             self._print_stats()
 
@@ -347,13 +337,22 @@ class TickScalper:
                             self.stats['maker_buy_qty'] += filled_qty
                         else:
                             self.stats['taker_buy_qty'] += filled_qty
-                        # ==========================================
-                        # ✅ 这里必须记录买入成本！
-                        # ==========================================
-                        if self.held_qty > self.min_qty:
-                            self.avg_cost = self.active_order_price
-                            logger.info(f"✅ 撤买单发现成交，更新持仓成本: {self.avg_cost}")
-                        # ==========================================
+                        
+                        # === [修改重点] 撤单时的加权平均逻辑 ===
+                        if self.held_qty > 0:
+                            # 注意：cancel_all 里的 self.held_qty 已经是 _sync_position_state 后的最新持仓(old_qty + filled)
+                            # 而 old_qty 是撤单前的持仓
+                            
+                            # 如果 old_qty 为 0，说明是底仓刚买入 -> 成本 = 挂单价
+                            if old_qty == 0:
+                                self.avg_cost = self.active_order_price
+                            else:
+                                # 说明是补仓部分成交 -> 加权平均
+                                total_val = (old_qty * self.avg_cost) + (filled_qty * self.active_order_price)
+                                self.avg_cost = total_val / self.held_qty
+                                self.dca_count += 1 # 既然有成交，就算一次补仓
+                            
+                            logger.info(f"✅ 撤买单成交，更新加权成本: {self.avg_cost:.5f}")
 
                     else:
                         # 卖单撤单成交：需要计算盈亏 [修复重点]
