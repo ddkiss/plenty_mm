@@ -328,6 +328,13 @@ class TickScalper:
                             self.stats['maker_buy_qty'] += filled_qty
                         else:
                             self.stats['taker_buy_qty'] += filled_qty
+                        # ==========================================
+                        # ✅ 这里必须记录买入成本！
+                        # ==========================================
+                        if self.held_qty > self.min_qty:
+                            self.avg_cost = self.active_order_price
+                            logger.info(f"✅ 撤买单发现成交，更新持仓成本: {self.avg_cost}")
+                        # ==========================================
 
                     else:
                         # 卖单撤单成交：需要计算盈亏 [修复重点]
