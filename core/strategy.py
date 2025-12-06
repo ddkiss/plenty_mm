@@ -392,18 +392,48 @@ class TickScalper:
         self.active_order_side = None
 
     def _sync_position_state(self):
-        """[复用] 强制同步持仓状态，用于撤单后或定期校准"""
+        """[重写] 强制同步持仓状态与成本，利用 API """
         try:
-            real_qty = self._get_real_position() # 调用新的通用查询方法
-            
-            # 只有当数量发生变化时才打印日志，减少刷屏
-            if real_qty != self.held_qty:
-                logger.info(f"🔄 持仓校准: 本地{self.held_qty} -> 链上{real_qty}")
-                self.held_qty = real_qty
+            # --- 1. 合约 (PERP) 逻辑 ---
+            if "PERP" in self.symbol:
+                positions = self.rest.get_positions(self.symbol)
+                found = False
+                
+                # 处理 API 返回列表的情况
+                if isinstance(positions, list):
+                    for p in positions:
+                        if p.get('symbol') == self.symbol:
+                            # [核心] 同步数量
+                            qty = float(p.get('netQuantity', 0))
+                            self.held_qty = abs(qty)
+                            
+                            # [核心] 同步成本 (仅当有持仓时)
+                            if self.held_qty > 0:
+                                entry_price = float(p.get('entryPrice', 0))
+                                # 只有当本地成本为0，或者想强制以交易所为准时，更新成本
+                                if entry_price > 0:
+                                    self.avg_cost = entry_price
+                                    logger.info(f"🔄 [API] 同步持仓: {self.held_qty} | 成本: {self.avg_cost}")
+                            
+                            found = True
+                            break
+                
+                # 如果没找到持仓信息，归零
+                if not found:
+                    self.held_qty = 0.0
+                    self.avg_cost = 0.0
+
+            # --- 2. 现货 (Spot) 逻辑 (保持不变) ---
+            else:
+                real_qty = self._get_real_position()
+                if real_qty != self.held_qty:
+                    logger.info(f"🔄 持仓校准: 本地{self.held_qty} -> 链上{real_qty}")
+                    self.held_qty = real_qty
                 
             # 过滤粉尘
             if self.held_qty < self.min_qty:
                 self.held_qty = 0.0
+                self.avg_cost = 0.0
                 
         except Exception as e:
             logger.error(f"持仓同步失败: {e}")
@@ -519,10 +549,15 @@ class TickScalper:
                 
                 # --- [修正结束] ---
 
-                # 如果是 SELLING 状态且成本未初始化，用当前买一价初始化
+                # 如果是 SELLING 状态且成本未初始化
                 if self.state == "SELLING" and self.avg_cost == 0:
-                    logger.warning(f"⚠️ 警告：检测到无成本持仓 (可能是重启或异常导致)！强制将成本重置为当前 Bid: {best_bid}")
-                    self.avg_cost = best_bid
+                    # 再次尝试同步一次，看能不能从 API 拿到 entryPrice
+                    self._sync_position_state()
+                    
+                    # 如果同步完还是 0 (说明 API 也没返回，或者现货模式)，再用兜底逻辑
+                    if self.avg_cost == 0:
+                        logger.warning(f"⚠️ 无法获取持仓成本，强制使用当前市价作为成本: {best_bid}")
+                        self.avg_cost = best_bid
 
                 # 执行策略
                 # --- [新增] 状态修正与重置 ---
