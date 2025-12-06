@@ -481,6 +481,7 @@ class TickScalper:
         self.strategy_active = True
         logger.info(f"策略启动: {self.symbol} | 资金利用比例: {self.cfg.BALANCE_PCT} | 止损: {self.cfg.STOP_LOSS_PCT*100}%")
 
+        self.dca_count = 0
         while self.running:
             time.sleep(0.5)
 
@@ -521,12 +522,29 @@ class TickScalper:
                     self.avg_cost = best_bid
 
                 # 执行策略
+                # --- [新增] 状态修正与重置 ---
+                # 如果持仓归零，重置 DCA 计数
+                if self.held_qty < self.min_qty and self.state == "SELLING" and not self.active_order_id:
+                    self.state = "IDLE"
+                    self.dca_count = 0
+                    self.avg_cost = 0
+
+                # --- [修改] 执行策略逻辑 ---
                 if self.state == "IDLE":
+                    self.dca_count = 0 # 确保 IDLE 时计数为 0
                     self._logic_buy(best_bid, best_ask)
+                    
                 elif self.state == "BUYING":
                     self._logic_chase_buy(best_bid)
+                    
                 elif self.state == "SELLING":
-                    self._logic_sell(best_bid, best_ask)
+                    # === [修改] DCA 逻辑接入 ===
+                    # 优先检查是否需要补仓
+                    if self._check_dca_condition(best_bid):
+                        self._logic_dca_buy(best_bid)
+                    else:
+                        # 不需要补仓，则执行正常的卖出逻辑
+                        self._logic_sell(best_bid, best_ask))
 
             except Exception as e:
                 logger.error(f"主循环发生错误: {e}")
