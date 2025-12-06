@@ -548,8 +548,7 @@ class TickScalper:
                     # 优先检查是否需要补仓
                     if self._check_dca_condition(best_bid):
                         self._logic_dca_buy(best_bid)
-                    else:
-                        # 不需要补仓，则执行正常的卖出逻辑
+                    elif not (self.active_order_id and self.active_order_side == 'Bid'):
                         self._logic_sell(best_bid, best_ask)
 
             except Exception as e:
@@ -675,7 +674,9 @@ class TickScalper:
     def _check_dca_condition(self, current_price):
         """检查是否满足补仓条件"""
         # 1. 基础检查：有挂单、余额不足、成本未初始化则不补
-        if self.active_order_id: return False
+        # 如果挂着【卖单】，我们允许继续往下检查价格，如果跌幅够了，就撤卖单补仓
+        if self.active_order_id and self.active_order_side == 'Bid': 
+            return False
         if self.avg_cost == 0: return False
         
         # 2. 计算当前跌幅
@@ -689,6 +690,10 @@ class TickScalper:
         return False
 
     def _logic_dca_buy(self, best_bid):
+        
+        if self.active_order_id:
+            logger.info("📉 触发补仓，撤销当前卖单以释放状态...")
+            self.cancel_all()
         """执行补仓下单"""
         # 计算补仓数量：持仓量 * 倍率 (这里简化为按数量倍投)
         # 如果你想按固定金额补仓，可以用 (USDC余额 * PCT) / price
