@@ -21,6 +21,8 @@ class TickScalper:
         self.strategy_active = False
         # 连续亏损计数器
         self.consecutive_loss_count = 0
+        # 当前补仓次数计数器
+        self.dca_count = 0
         
         # Order Tracking
         self.active_order_id = None
@@ -627,3 +629,45 @@ class TickScalper:
                  if abs(self.active_order_price - best_ask) > self.tick_size / 2:
                     logger.info("超时追单调整...")
                     self.cancel_all()
+
+    # --- [新增] DCA 核心逻辑方法 ---
+
+    def _check_dca_condition(self, current_price):
+        """检查是否满足补仓条件"""
+        # 1. 基础检查：有挂单、余额不足、成本未初始化则不补
+        if self.active_order_id: return False
+        if self.avg_cost == 0: return False
+        
+        # 2. 计算当前跌幅
+        drop_pct = (self.avg_cost - current_price) / self.avg_cost
+        
+        # 3. 判断：跌幅达标 且 次数未用完
+        if (drop_pct > self.cfg.DCA_DROP_PCT) and (self.dca_count < self.cfg.MAX_DCA_COUNT):
+             # 简单的余额检查 (确保够买至少 1 个最小单位)
+             if self.get_usdc_balance() > (self.min_qty * current_price):
+                 return True
+        return False
+
+    def _logic_dca_buy(self, best_bid):
+        """执行补仓下单"""
+        # 计算补仓数量：持仓量 * 倍率 (这里简化为按数量倍投)
+        # 如果你想按固定金额补仓，可以用 (USDC余额 * PCT) / price
+        # 这里演示按持仓倍率补：
+        qty = self.held_qty * self.cfg.DCA_MULTIPLIER
+        
+        # 再次检查余额是否足够，不够就用全部余额
+        usdc_balance = self.get_usdc_balance()
+        if (qty * best_bid) > usdc_balance:
+            qty = usdc_balance / best_bid
+            
+        qty = floor_to(qty, self.base_precision)
+        if qty < self.min_qty:
+            logger.warning("余额不足以执行 DCA 补仓")
+            return
+
+        logger.info(f"📉 触发第 {self.dca_count + 1} 次补仓: 现价{best_bid} < 成本{self.avg_cost}")
+        
+        # 下单 (PostOnly=True 尽量挂单，如果急于补仓可以设为 False)
+        # 注意：这里我们复用 _place_order，它会更新 active_order_id
+        # 下单成功后，我们在 check_order 里处理成交和成本更新
+        self._place_order("Bid", best_bid, qty, post_only=True)
