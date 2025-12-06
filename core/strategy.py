@@ -43,6 +43,7 @@ class TickScalper:
         
         # Control
         self.last_cool_down = 0
+        self.current_cool_down_time = 0  # 动态记录当前需要的冷却时长
         self.running = False
         
         # --- 统计数据 ---
@@ -224,12 +225,21 @@ class TickScalper:
                             self.held_qty = 0
                             # [新增/迁移] 连续亏损冷却逻辑
                             if trade_pnl < 0:
-                                self.consecutive_loss_count += 1
-                                logger.warning(f"📉 本次亏损，连续亏损计数: {self.consecutive_loss_count}")
-                                if self.consecutive_loss_count >= 2:
-                                    self.last_cool_down = time.time()
-                                    logger.warning(f"🛑 连续止损达标(2次)，触发冷却 {self.cfg.COOL_DOWN}s")
-                                    self.consecutive_loss_count = 0 
+                            self.consecutive_loss_count += 1
+                            logger.warning(f"📉 本次亏损，连续亏损计数: {self.consecutive_loss_count}")
+                            
+                            if self.consecutive_loss_count == 1:
+                                # [新增] 第一次止损：设置较短的 5秒 冷却
+                                self.last_cool_down = time.time()
+                                self.current_cool_down_time = 5 
+                                logger.warning(f"🛑 首次止损，触发短冷却 5s")
+                                
+                            elif self.consecutive_loss_count >= 2:
+                                # [修改] 第二次止损：设置完整的冷却时间 (如 180s)
+                                self.last_cool_down = time.time()
+                                self.current_cool_down_time = self.cfg.COOL_DOWN
+                                logger.warning(f"🛑 连续止损达标(2次)，触发长冷却 {self.cfg.COOL_DOWN}s")
+                                self.consecutive_loss_count = 0 
                             else:
                                 if self.consecutive_loss_count > 0:
                                     logger.info("✅ 本次盈利，连续亏损计数重置")
@@ -440,7 +450,7 @@ class TickScalper:
             try:
                 self._check_order_via_rest()
                 
-                if time.time() - self.last_cool_down < self.cfg.COOL_DOWN:
+                if time.time() - self.last_cool_down < self.current_cool_down_time:
                     continue
 
                 # 获取深度 (limit=5)
