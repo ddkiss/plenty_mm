@@ -21,6 +21,7 @@ class TickScalper:
         self.strategy_active = False
         # 当前补仓次数计数器
         self.dca_count = 0
+        self.last_buy_price = 0.0
         
         # Order Tracking
         self.active_order_id = None
@@ -199,8 +200,7 @@ class TickScalper:
                     # 如果持仓增加了
                     if self.held_qty > old_qty:
                         logger.info(f"✅ 买单成交 (持仓 {old_qty} -> {self.held_qty})")
-                        
-                        
+                        self.last_buy_price = self.active_order_price 
                         logger.info(f"🔄 最新成本(API): {self.avg_cost:.5f} (DCA次数: {self.dca_count})")
                         
                         self.hold_start_time = time.time()
@@ -323,8 +323,8 @@ class TickScalper:
                         # [删除] 之前这里的一大段手动加权平均计算代码全部删掉
                         # [新增] 仅做日志记录
                         if self.held_qty > 0:
+                            self.last_buy_price = self.active_order_price
                             # 既然有成交，且是补仓/买入，DCA计数加1
-                            # 注意：如果是底仓成交，dca_count 本来就是0，这里加1不太对？
                             # 修正逻辑：如果是补仓(SELLING状态下买入)，才加计数。
                             if self.state == "SELLING":
                                 self.dca_count += 1
@@ -381,6 +381,10 @@ class TickScalper:
                                 # 只有当本地成本为0，或者想强制以交易所为准时，更新成本
                                 if entry_price > 0:
                                     self.avg_cost = entry_price
+                                    # === [插入这段兜底逻辑] ===
+                                    if self.last_buy_price == 0:
+                                        self.last_buy_price = self.avg_cost
+                                    # ========================
                                     logger.info(f"🔄 [API] 同步持仓: {self.held_qty} | 成本: {self.avg_cost}")
                             
                             found = True
@@ -678,9 +682,9 @@ class TickScalper:
         if self.active_order_id and self.active_order_side == 'Bid': 
             return False
         if self.avg_cost == 0: return False
-        
+        reference_price = self.last_buy_price if self.last_buy_price > 0 else self.avg_cost
         # 2. 计算当前跌幅
-        drop_pct = (self.avg_cost - current_price) / self.avg_cost
+        drop_pct = (reference_price - current_price) / reference_price
         
         # 3. 判断：跌幅达标 且 次数未用完
         if (drop_pct > self.cfg.DCA_DROP_PCT) and (self.dca_count < self.cfg.MAX_DCA_COUNT):
