@@ -373,7 +373,9 @@ class TickScalper:
                         
                         if net_pnl < 0:
                             self.consecutive_loss_count += 1
-                            logger.warning(f"📉 撤单发现亏损成交，连续亏损计数: {self.consecutive_loss_count}")
+                            self.last_cool_down = time.time()
+                            self.current_cool_down_time = self.cfg.COOL_DOWN 
+                            logger.warning(f"📉 撤单发现亏损成交，执行长冷却 {self.cfg.COOL_DOWN}s")
                         else:
                             self.consecutive_loss_count = 0
                     
@@ -544,7 +546,7 @@ class TickScalper:
                         self._logic_dca_buy(best_bid)
                     else:
                         # 不需要补仓，则执行正常的卖出逻辑
-                        self._logic_sell(best_bid, best_ask))
+                        self._logic_sell(best_bid, best_ask)
 
             except Exception as e:
                 logger.error(f"主循环发生错误: {e}")
