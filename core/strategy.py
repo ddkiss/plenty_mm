@@ -158,7 +158,7 @@ class TickScalper:
                         break
             
             if is_open:
-                # 订单还在挂着，什么都不用做 (或者在这里处理超时逻辑)
+                # 订单还在挂着
                 pass
             else:
                 # 订单不见了！说明要么成交了，要么被取消了
@@ -176,23 +176,19 @@ class TickScalper:
                     # --- [修改开始] 完善统计逻辑 ---
                     self.stats['total_quote_vol'] += trade_val
                     
-                    # 区分买卖方向
                     if self.active_order_side == 'Bid':
                         self.stats['total_buy_qty'] += filled_qty
-                        # 区分 Maker/Taker
                         if self.active_order_is_maker:
                             self.stats['maker_buy_qty'] += filled_qty
                         else:
                             self.stats['taker_buy_qty'] += filled_qty
                     else:
                         self.stats['total_sell_qty'] += filled_qty
-                        # 区分 Maker/Taker
                         if self.active_order_is_maker:
                             self.stats['maker_sell_qty'] += filled_qty
                         else:
                             self.stats['taker_sell_qty'] += filled_qty
                     
-                    # 累加 Taker 成交额 (用于算费率)
                     if not self.active_order_is_maker:
                         self.stats['taker_quote_vol'] += trade_val
                 
@@ -201,7 +197,7 @@ class TickScalper:
                     if real_qty > self.held_qty:
                         logger.info(f"✅ 买单成交 (持仓 {self.held_qty} -> {real_qty})")
                         self.held_qty = real_qty
-                        # 简单估算成本 (REST轮询无法获取精确成交均价，暂用挂单价代替)
+                        # 简单估算成本
                         self.avg_cost = self.active_order_price 
                         self.hold_start_time = time.time()
                         self.state = "SELLING"
@@ -213,29 +209,32 @@ class TickScalper:
                     if real_qty < self.held_qty:
                         logger.info(f"✅ 卖单成交 (持仓 {self.held_qty} -> {real_qty})")
                         
-                        # [新增/迁移] 盈亏计算与统计更新
                         trade_pnl = (self.active_order_price - self.avg_cost) * (self.held_qty - real_qty)
                         self.stats['trade_count'] += 1
                         self.stats['total_pnl'] += trade_pnl
-                        # 注意：REST轮询难以获取精确fee，暂时忽略或用估算值
                         
+                        # [新增修复] 计算净利润用于止损判断
+                        trade_val_sell = self.active_order_price * (self.held_qty - real_qty)
+                        # 如果是 Maker 假定0费率，否则使用配置的 Taker 费率
+                        fee_rate = 0 if self.active_order_is_maker else self.cfg.TAKER_FEE_RATE
+                        net_pnl = trade_pnl - (trade_val_sell * fee_rate)
+
                         self.held_qty = real_qty
                         if self.held_qty < self.min_qty:
                             self.state = "IDLE"
                             self.held_qty = 0
-                            # [新增/迁移] 连续亏损冷却逻辑
-                            if trade_pnl < 0:
+                            
+                            # [修改] 使用净利润 net_pnl 判断是否亏损
+                            if net_pnl < 0:
                                 self.consecutive_loss_count += 1
-                                logger.warning(f"📉 本次亏损，连续亏损计数: {self.consecutive_loss_count}")
+                                logger.warning(f"📉 本次净亏损(含费)，连续亏损计数: {self.consecutive_loss_count}")
                             
                             if self.consecutive_loss_count == 1:
-                                # [新增] 第一次止损：设置较短的 5秒 冷却
                                 self.last_cool_down = time.time()
                                 self.current_cool_down_time = 5 
                                 logger.warning(f"🛑 首次止损，触发短冷却 5s")
                                 
                             elif self.consecutive_loss_count >= 2:
-                                # [修改] 第二次止损：设置完整的冷却时间 (如 180s)
                                 self.last_cool_down = time.time()
                                 self.current_cool_down_time = self.cfg.COOL_DOWN
                                 logger.warning(f"🛑 连续止损达标(2次)，触发长冷却 {self.cfg.COOL_DOWN}s")
@@ -245,13 +244,10 @@ class TickScalper:
                                     logger.info("✅ 本次盈利，连续亏损计数重置")
                                 self.consecutive_loss_count = 0
                                 
-                            # [新增] 打印报表
                             self._print_stats()
 
-                    
                     else:
                         logger.info("❌ 卖单被取消 (持仓未减少)")
-                        # 保持 SELLING 状态，主循环会重试
                 
                 # 3. 清理 ID
                 self.active_order_id = None
@@ -318,6 +314,7 @@ class TickScalper:
                 self._sync_position_state()
                 #  补算撤单期间产生的成交量
                 filled_qty = abs(self.held_qty - old_qty)
+                
                 if filled_qty > 0:
                     trade_val = filled_qty * self.active_order_price
                     
@@ -327,18 +324,32 @@ class TickScalper:
                     # 区分买卖方向
                     if self.active_order_side == 'Bid':
                         self.stats['total_buy_qty'] += filled_qty
-                        # 区分 Maker/Taker
                         if self.active_order_is_maker:
                             self.stats['maker_buy_qty'] += filled_qty
                         else:
                             self.stats['taker_buy_qty'] += filled_qty
                     else:
+                        # 卖单撤单成交：需要计算盈亏 [修复重点]
                         self.stats['total_sell_qty'] += filled_qty
-                        # 区分 Maker/Taker
                         if self.active_order_is_maker:
                             self.stats['maker_sell_qty'] += filled_qty
                         else:
                             self.stats['taker_sell_qty'] += filled_qty
+                        
+                        # [新增修复] 计算这部分成交的盈亏
+                        trade_pnl = (self.active_order_price - self.avg_cost) * filled_qty
+                        self.stats['total_pnl'] += trade_pnl
+                        
+                        # [新增修复] 计算净利并更新连续亏损计数
+                        # 估算手续费 (保守按 Taker 算，或者根据 active_order_is_maker 判断)
+                        fee_rate = 0 if self.active_order_is_maker else self.cfg.TAKER_FEE_RATE
+                        net_pnl = trade_pnl - (trade_val * fee_rate)
+                        
+                        if net_pnl < 0:
+                            self.consecutive_loss_count += 1
+                            logger.warning(f"📉 撤单发现亏损成交，连续亏损计数: {self.consecutive_loss_count}")
+                        else:
+                            self.consecutive_loss_count = 0
                     
                     # 累加 Taker 成交额 (用于算费率)
                     if not self.active_order_is_maker:
@@ -544,14 +555,23 @@ class TickScalper:
         # 1. 计算挂单存活时间
         order_duration = time.time() - self.active_order_time
         
-        # 2. 计算触发价格阈值 (当前挂单价 + 3个最小跳动单位)
+        # 2. 计算触发价格阈值 (当前挂单价 + 4个最小跳动单位)
         chase_threshold = self.active_order_price + (4 * self.tick_size)
         
-        # 3. 判断核心逻辑：同时满足 [时间超过5秒] 且 [价格偏离超过5tick]
+        # 3. 判断核心逻辑：同时满足 [时间超过10秒] 且 [价格偏离超过阈值]
         if (order_duration > 10) and (best_bid > chase_threshold):
             logger.info(f"🚀 追涨触发: 挂单已持续 {order_duration:.1f}s 且 市场价{best_bid} > 阈值{chase_threshold:.5f}")
             self.cancel_all()
-            self.state = "IDLE"
+            
+            # [新增修复] 撤单后检查是否持有仓位
+            if self.held_qty > self.min_qty:
+                logger.info(f"🔄 追单撤销后持有 {self.held_qty}，转为卖出状态")
+                self.state = "SELLING"
+                # 如果还没初始化成本，暂时用刚才的挂单价作为成本
+                if self.avg_cost == 0:
+                    self.avg_cost = self.active_order_price
+            else:
+                self.state = "IDLE"
 
     def _logic_sell(self, best_bid, best_ask):
         # 1. 如果没有挂单
