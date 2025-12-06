@@ -561,7 +561,7 @@ class TickScalper:
             
             # 止损逻辑
             if pnl_pct < -self.cfg.STOP_LOSS_PCT:
-                target_price = best_ask
+                target_price = best_bid
                 post_only = False
                 logger.warning(f"🚨 止损 -> Taker")
             elif duration > self.cfg.STOP_LOSS_TIMEOUT:
