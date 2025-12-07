@@ -694,6 +694,25 @@ class TickScalper:
                  return True
         return False
 
+    def _logic_check_dca_buy(self, best_bid):
+        """[新增] 检查 DCA 补仓单是否滞后/超时，如果是则撤单以恢复流动性"""
+        # 1. 双重检查：确保当前是买单
+        if not (self.active_order_id and self.active_order_side == 'Bid'):
+            return
+
+        # 2. 计算挂单已持续时间
+        duration = time.time() - self.active_order_time
+        
+        # 3. 设定撤单阈值
+        # 条件 A: 挂单超过 10秒 (给成交一点耐心)
+        # 条件 B: 市场价已经反弹超过 7个 Tick (说明挂单价格已经明显偏低，接不到了)
+        # 你可以根据需要调整 tick 数量，例如 5~10 个
+        rebound_threshold = self.active_order_price + (7 * self.tick_size)
+        
+        if (duration > 10) and (best_bid > rebound_threshold):
+            logger.info(f"⚠️ DCA补仓未成交：已挂{duration:.1f}s 且 现价{best_bid} > 挂单{self.active_order_price}。撤单恢复...")
+            self.cancel_all()
+            # 撤单后，状态依然是 SELLING，下一轮循环会自动判断是 卖出 还是 重新找机会补仓
     def _logic_dca_buy(self, best_bid):
         
         if self.active_order_id:
@@ -721,3 +740,4 @@ class TickScalper:
         # 注意：这里我们复用 _place_order，它会更新 active_order_id
         # 下单成功后，我们在 check_order 里处理成交和成本更新
         self._place_order("Bid", best_bid, qty, post_only=True)
+    
