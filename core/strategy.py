@@ -549,13 +549,21 @@ class TickScalper:
                     self._logic_chase_buy(best_bid)
                     
                 elif self.state == "SELLING":
-                    # === [修改] DCA 逻辑接入 ===
-                    # 优先检查是否需要补仓
-                    if self._check_dca_condition(best_bid):
+                    # === [新增] 1. 如果挂着 DCA 补仓单，检查是否需要撤单 (防止卡死) ===
+                    if self.active_order_id and self.active_order_side == 'Bid':
+                        self._logic_check_dca_buy(best_bid)
+                    
+                    # === 2. 检查是否触发新的补仓 ===
+                    # 注意：如果上面没撤单，_check_dca_condition 会返回 False，流程结束
+                    # 如果上面撤单了，这里因为剛撤单 active_order_id 为空，可能会重新评估补仓或跳过
+                    elif self._check_dca_condition(best_bid):
                         self._logic_dca_buy(best_bid)
+                    
+                    # === 3. 正常卖出逻辑 ===
+                    # 只有在没有挂【补仓买单】的时候，才允许挂卖单
                     elif not (self.active_order_id and self.active_order_side == 'Bid'):
                         self._logic_sell(best_bid, best_ask)
-
+                        
             except Exception as e:
                 logger.error(f"主循环发生错误: {e}")
                 time.sleep(1)
