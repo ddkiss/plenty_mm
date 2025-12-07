@@ -713,6 +713,7 @@ class TickScalper:
             logger.info(f"⚠️ DCA补仓未成交：已挂{duration:.1f}s 且 现价{best_bid} > 挂单{self.active_order_price}。撤单恢复...")
             self.cancel_all()
             # 撤单后，状态依然是 SELLING，下一轮循环会自动判断是 卖出 还是 重新找机会补仓
+    
     def _logic_dca_buy(self, best_bid):
         
         if self.active_order_id:
