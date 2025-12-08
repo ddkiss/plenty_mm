@@ -164,21 +164,18 @@ class DualMaker:
             time_str = beijing_now.strftime('%H:%M:%S')
 
             msg = (
-                f"\n{'='*12} 📊 策略运行汇总 ({time_str}) {'='*12}\n"
-                f"交易对:   {self.symbol}\n"  # <--- 已添加此行
+                f"\n{'='*3} 📊 策略运行汇总 ({time_str}) {'='*3}\n"
                 f"运行时间: {run_time_str}\n"
-                f"当前模式: {self.mode}\n"
-                f"------------------------------------------\n"
+                f"当前模式: {self.symbol} ｜ {self.mode}\n"
                 f"初始净值: {self.initial_equity:.2f} USDC\n"
                 f"当前净值: {self.equity:.2f} USDC\n"
                 f"累计盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
-                f"------------------------------------------\n"
+                f"---\n"
                 f"成交次数: {self.stats['fill_count']} 次\n"
                 f"总成交量: {self.stats['total_volume']:.4f}\n"
-                f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"
-                f"估算手续费: {self.stats['total_fee']:.4f} USDC\n"
+                f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"             
                 f"资金磨损率: {wear_rate:.4f}%\n"
-                f"{'='*40}\n"
+                f"{'='*5}\n"
             )
             logger.info(msg)
         except Exception as e:
