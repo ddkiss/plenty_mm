@@ -323,37 +323,63 @@ class DualMaker:
             pass
 
     def _logic_unwind(self, best_bid, best_ask):
-        """回本模式"""
+        """回本模式 (修正版：超时自动调整挂单紧贴盘口，纯 Maker)"""
+        # 计算是否超时
         timeout = (time.time() - self.unwind_start_time > self.cfg.BREAKEVEN_TIMEOUT)
         
-        # 多头平仓
+        # ==========================================
+        # 场景 A: 多头平仓 (手里有币，要卖)
+        # ==========================================
         if self.held_qty > self.min_qty:
+            # 1. 必须先撤销反向单 (买单)
             if self.active_buy_id: self.cancel_all()
             
+            # 2. [新增] 超时活跃检查
+            # 如果处于超时状态，且当前有挂单，检查挂单价格是否还是“卖一价”
+            if self.active_sell_id and timeout:
+                # 如果挂单价与当前卖一价偏差超过半个 tick，说明价格跑了
+                if abs(self.active_sell_price - best_ask) > self.tick_size / 2:
+                    logger.info(f"⏰ 回本超时 -> 价格偏离，撤单重挂紧贴卖一: {best_ask}")
+                    self.cancel_all()
+                    return # 撤单后直接返回，等下一轮循环重新挂
+
+            # 3. 挂单逻辑
             if not self.active_sell_id:
-                target = max(self.avg_cost + self.tick_size, best_ask)
-                if timeout: target = best_ask 
+                # 正常模式：保本出 (成本价+1跳) 和 卖一价，取较大值 (不想亏本)
+                # 超时模式：不看成本了，直接挂 卖一价 (best_ask)，只求成交
+                target = best_ask if timeout else max(self.avg_cost + self.tick_size, best_ask)
                 
                 qty = abs(self.held_qty)
+                # 依然保持默认的 Maker 属性 (postOnly=True)
                 self.active_sell_id = self._place("Ask", target, qty)
                 
-                # [新增] 记录统计信息
                 if self.active_sell_id:
                     self.active_sell_price = target
                     self.active_sell_qty = qty
 
-        # 空头平仓
+        # ==========================================
+        # 场景 B: 空头平仓 (手里欠币，要买)
+        # ==========================================
         elif self.held_qty < -self.min_qty:
             if self.active_sell_id: self.cancel_all()
             
+            # 2. [新增] 超时活跃检查
+            if self.active_buy_id and timeout:
+                # 如果挂单价与当前买一价不同，撤单重追
+                if abs(self.active_buy_price - best_bid) > self.tick_size / 2:
+                    logger.info(f"⏰ 回本超时 -> 价格偏离，撤单重挂紧贴买一: {best_bid}")
+                    self.cancel_all()
+                    return
+
+            # 3. 挂单逻辑
             if not self.active_buy_id:
-                target = min(self.avg_cost - self.tick_size, best_bid)
-                if timeout: target = best_bid
+                # 正常模式：保本回 (成本价-1跳) 和 买一价，取较小值
+                # 超时模式：不看成本了，直接挂 买一价 (best_bid)
+                target = best_bid if timeout else min(self.avg_cost - self.tick_size, best_bid)
                 
                 qty = abs(self.held_qty)
                 self.active_buy_id = self._place("Bid", target, qty)
                 
-                # [新增] 记录统计信息
                 if self.active_buy_id:
                     self.active_buy_price = target
                     self.active_buy_qty = qty
