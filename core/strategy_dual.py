@@ -75,10 +75,15 @@ class DualMaker:
             # 1. 获取净值 (用于计算下单量)
             col = self.rest.get_collateral()
             if isinstance(col, dict):
-                current_equity = float(col.get("netEquityAvailable", 0))
+                # [修改] 使用 netEquity (账户总权益) 替代 netEquityAvailable
+                # netEquity = 可用余额 + 挂单冻结 + 未实现盈亏，数据更稳定
+                current_equity = float(col.get("netEquity", 0))
+                
                 # 记录初始资金
                 if self.initial_equity == 0 and current_equity > 0:
                     self.initial_equity = current_equity
+                
+                # 更新当前净值
                 self.equity = current_equity
             
             # 2. 获取持仓 (Perp)
