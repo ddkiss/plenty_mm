@@ -674,7 +674,9 @@ class TickScalper:
                 return
 
             # 计算当前浮动盈亏
-            current_pnl_pct = (best_bid - self.avg_cost) / self.avg_cost            
+            # [修改] 同样使用最后一次买入价作为止损基准
+            ref_price = self.last_buy_price if self.last_buy_price > 0 else self.avg_cost
+            current_pnl_pct = (best_bid - ref_price) / ref_price            
             # 检查是否在挂单期间跌破止损线
             if current_pnl_pct < -self.cfg.STOP_LOSS_PCT:
                 logger.warning(f"🚨 挂单期间触发价格止损 (PnL: {current_pnl_pct*100:.2f}%) -> 撤单准备止损")
