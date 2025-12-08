@@ -657,10 +657,10 @@ class TickScalper:
             post_only = True
             
             # 止损逻辑
-            if pnl_pct < -self.cfg.STOP_LOSS_PCT:
+            if (pnl_pct < -self.cfg.STOP_LOSS_PCT) and (self.dca_count >= self.cfg.MAX_DCA_COUNT):
                 target_price = best_bid
                 post_only = False
-                logger.warning(f"🚨 止损 -> Taker")
+                logger.warning(f"🚨 止损 -> Taker (DCA次数已耗尽: {self.dca_count})")
             elif duration > self.cfg.STOP_LOSS_TIMEOUT:
                 target_price = best_ask
                 logger.warning(f"⏰ 超时 -> Maker")
@@ -678,7 +678,7 @@ class TickScalper:
             ref_price = self.last_buy_price if self.last_buy_price > 0 else self.avg_cost
             current_pnl_pct = (best_bid - ref_price) / ref_price            
             # 检查是否在挂单期间跌破止损线
-            if current_pnl_pct < -self.cfg.STOP_LOSS_PCT:
+            if (current_pnl_pct < -self.cfg.STOP_LOSS_PCT) and (self.dca_count >= self.cfg.MAX_DCA_COUNT):
                 logger.warning(f"🚨 挂单期间触发价格止损 (PnL: {current_pnl_pct*100:.2f}%) -> 撤单准备止损")
                 self.cancel_all()
                 return
