@@ -1,4 +1,5 @@
 import time
+from datetime import datetime, timedelta
 from .utils import logger, round_to_step, floor_to
 from .rest_client import BackpackREST
 
@@ -17,6 +18,12 @@ class DualMaker:
         self.active_buy_id = None
         self.active_sell_id = None
         
+        # [新增] 记录挂单详情用于统计
+        self.active_buy_qty = 0.0
+        self.active_sell_qty = 0.0
+        self.active_buy_price = 0.0
+        self.active_sell_price = 0.0
+        
         # 仓位与资产
         self.held_qty = 0.0
         self.avg_cost = 0.0
@@ -26,6 +33,16 @@ class DualMaker:
         self.mode = "DUAL"  # DUAL(双向刷量) / UNWIND(回本/止损)
         self.last_fill_time = 0 
         self.unwind_start_time = 0
+        
+        # [新增] 统计数据
+        self.start_time = time.time()
+        self.initial_equity = 0.0 # 初始净值
+        self.stats = {
+            'fill_count': 0,        # 成交次数
+            'total_volume': 0.0,    # 总交易量 (Base Asset)
+            'total_quote_vol': 0.0, # 总交易额 (Quote Asset)
+            'total_fee': 0.0,       # 估算手续费
+        }
 
     def init_market_info(self):
         """初始化市场精度信息"""
@@ -52,12 +69,17 @@ class DualMaker:
         同步状态核心：
         1. 更新资产和持仓。
         2. 检查挂单是否存活（以此判断是否成交）。
+        3. [新增] 触发统计打印
         """
         try:
             # 1. 获取净值 (用于计算下单量)
             col = self.rest.get_collateral()
             if isinstance(col, dict):
-                self.equity = float(col.get("netEquityAvailable", 0))
+                current_equity = float(col.get("netEquityAvailable", 0))
+                # 记录初始资金
+                if self.initial_equity == 0 and current_equity > 0:
+                    self.initial_equity = current_equity
+                self.equity = current_equity
             
             # 2. 获取持仓 (Perp)
             positions = self.rest.get_positions(self.symbol)
@@ -73,30 +95,94 @@ class DualMaker:
                 self.held_qty = 0.0
                 self.avg_cost = 0.0
 
-            # 3. [关键] 反推订单状态
+            # 3. 反推订单状态与统计成交
             open_orders = self.rest.get_open_orders(self.symbol)
             if not isinstance(open_orders, list):
                 open_orders = [] 
             
-            # 当前交易所实际挂着的订单 ID 集合
             active_ids = {str(o['id']) for o in open_orders}
             
-            # 检查买单
+            trade_occurred = False
+            
+            # --- 检查买单 ---
             if self.active_buy_id:
                 if str(self.active_buy_id) not in active_ids:
                     logger.info(f"🔔 买单已消失(成交/被撤) -> ID: {self.active_buy_id}")
+                    # 更新统计
+                    self._update_stats("Buy", self.active_buy_price, self.active_buy_qty)
                     self.active_buy_id = None 
-                    self.last_fill_time = time.time() # 更新成交时间
+                    self.last_fill_time = time.time()
+                    trade_occurred = True
             
-            # 检查卖单
+            # --- 检查卖单 ---
             if self.active_sell_id:
                 if str(self.active_sell_id) not in active_ids:
                     logger.info(f"🔔 卖单已消失(成交/被撤) -> ID: {self.active_sell_id}")
+                    # 更新统计
+                    self._update_stats("Sell", self.active_sell_price, self.active_sell_qty)
                     self.active_sell_id = None
                     self.last_fill_time = time.time()
+                    trade_occurred = True
+
+            # 如果发生了成交，打印一次汇总
+            if trade_occurred:
+                self._print_stats()
 
         except Exception as e:
             logger.error(f"Sync Error: {e}")
+
+    def _update_stats(self, side, price, qty):
+        """更新内部统计数据"""
+        quote_vol = price * qty
+        fee = quote_vol * self.cfg.TAKER_FEE_RATE # 仅作估算参考
+        
+        self.stats['fill_count'] += 1
+        self.stats['total_volume'] += qty
+        self.stats['total_quote_vol'] += quote_vol
+        self.stats['total_fee'] += fee
+
+    def _print_stats(self):
+        """[新增] 打印策略运行汇总面板"""
+        try:
+            now = time.time()
+            duration = now - self.start_time
+            run_time_str = str(timedelta(seconds=int(duration)))
+            
+            # 动态计算 PnL
+            current_pnl = 0.0
+            pnl_percent = 0.0
+            if self.initial_equity > 0:
+                current_pnl = self.equity - self.initial_equity
+                pnl_percent = (current_pnl / self.initial_equity) * 100
+
+            # 估算磨损率 (PnL / 成交额)
+            wear_rate = 0.0
+            if self.stats['total_quote_vol'] > 0:
+                wear_rate = (abs(current_pnl) / self.stats['total_quote_vol']) * 100
+
+            beijing_now = datetime.utcnow() + timedelta(hours=8)
+            time_str = beijing_now.strftime('%H:%M:%S')
+
+            msg = (
+                f"\n{'='*4} 📊 策略运行汇总 ({time_str}) {'='*2}\n"
+                f"交易对:   {self.symbol}\n"  # <--- 已添加此行
+                f"运行时间: {run_time_str}\n"
+                f"当前模式: {self.mode}\n"
+                f"---\n"
+                f"初始净值: {self.initial_equity:.2f} USDC\n"
+                f"当前净值: {self.equity:.2f} USDC\n"
+                f"累计盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
+                f"---\n"
+                f"成交次数: {self.stats['fill_count']} 次\n"
+                f"总成交量: {self.stats['total_volume']:.4f}\n"
+                f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"
+                f"估算手续费: {self.stats['total_fee']:.4f} USDC\n"
+                f"资金磨损率: {wear_rate:.4f}%\n"
+                f"{'='*5}\n"
+            )
+            logger.info(msg)
+        except Exception as e:
+            logger.error(f"Print Stats Error: {e}")
 
     def _place(self, side, price, qty):
         """下单包装函数：异常不中断，返回 ID 或 None"""
@@ -128,9 +214,10 @@ class DualMaker:
         except Exception:
             pass
         finally:
-            # 无论 API 是否成功，本地状态先重置，防止死锁
             self.active_buy_id = None
             self.active_sell_id = None
+            # 撤单后不重置 qty/price，防止 _sync_state 在撤单后无法统计到刚结束的订单
+            # (虽然大概率 _sync_state 是下一轮才跑，但保留无害)
 
     def run(self):
         self.init_market_info()
@@ -142,22 +229,19 @@ class DualMaker:
             time.sleep(0.5) # 轮询间隔
 
             try:
-                # 1. 同步状态
+                # 1. 同步状态 (内含成交检测与 Stats 打印)
                 self._sync_state()
 
                 # 2. 仓位风控检查
-                # 计算持仓占用 (持仓价值 / 净值)
                 exposure = abs(self.held_qty * self.avg_cost)
-                # [关键修改]：计算杠杆后的“有效总资金”
-                # 如果净值是 100，杠杆是 7，有效资金就是 700
                 effective_capital = self.equity * self.cfg.LEVERAGE
                 ratio = exposure / effective_capital if effective_capital > 0 else 0
                 
                 if ratio > self.cfg.MAX_POSITION_PCT:
                     if self.mode == "DUAL":
-                        logger.warning(f"⚠️ 仓位过重 ({ratio:.1%}) -> 切换至 UNWIND 回本模式")
+                        logger.warning(f"⚠️ 仓位过重 (占比{ratio:.1%} > {self.cfg.MAX_POSITION_PCT*100}%) -> 切换至 UNWIND 回本模式")
                         self.mode = "UNWIND"
-                        self.cancel_all() # 撤双向单
+                        self.cancel_all()
                         self.unwind_start_time = time.time()
                 elif self.held_qty == 0 and self.mode == "UNWIND":
                     logger.info("🎉 仓位已清空 -> 恢复 DUAL 模式")
@@ -173,7 +257,6 @@ class DualMaker:
                 if len(bids) < 2 or len(asks) < 2: continue
                 
                 # 取买2卖2
-                # [0]是买1, [1]是买2
                 bid_1 = float(bids[0][0])
                 ask_1 = float(asks[0][0])
                 bid_2 = float(bids[1][0])
@@ -190,98 +273,85 @@ class DualMaker:
                 time.sleep(1)
 
     def _logic_dual(self, target_bid, target_ask):
-        """
-        双向挂单逻辑 (静默版)
-        - 只有在一边成交（导致单腿）或两边都无单时才行动。
-        - 忽略价格微小偏离。
-        """
+        """双向挂单逻辑 (静默版)"""
         
-        # 冷却期 (仅在刚成交完后等待)
+        # 冷却期
         if time.time() - self.last_fill_time < self.cfg.REBALANCE_WAIT:
             return
 
-        # ==========================================
-        # 1. 状态检查与异常处理
-        # ==========================================
+        # 1. 状态检查
         has_buy = (self.active_buy_id is not None)
         has_sell = (self.active_sell_id is not None)
         
-        # 【场景 A】: 双边都有挂单 -> 静止不动 (Stay Put)
-        # 即使价格偏离了，只要没成交，我们就不动，等待回调吃单。
+        # 场景 A: 双边都有挂单 -> 不动
         if has_buy and has_sell:
             return 
 
-        # 【场景 B】: 只有一边挂单 (Legging / Partial Fill)
-        # 可能是：1. 刚成交了一边 2. 上一轮挂单只成功了一边
-        # 动作：撤销剩下那个“孤儿单”，为了在下一轮重新以最新价格成对挂单
+        # 场景 B: 单边挂单 -> 撤单重置
         if has_buy != has_sell:
-            # logger.info(f"检测到单边挂单 (Buy={has_buy}, Sell={has_sell}) -> 撤单重置")
             self.cancel_all()
             return
 
-        # ==========================================
-        # 2. 空仓开单 (Atomic Placement)
-        # ==========================================
-        # 只有当两边都没单子的时候 (active_buy_id 和 active_sell_id 都是 None)
+        # 2. 空仓开单
+        qty = (self.equity * self.cfg.LEVERAGE * self.cfg.GRID_ORDER_PCT) / target_ask
         
-        # 计算下单量
-        qty = (self.equity * self.cfg.GRID_ORDER_PCT * self.cfg.LEVERAGE) / target_ask
-        
-        # 价格保护：防止买2 >= 卖2 (异常盘口)
-        if target_bid >= target_ask:
-            return 
+        if target_bid >= target_ask: return 
 
-        # 尝试双向发单
-        # 注意：这里我们不判断 drift，直接取当前的 target_bid/ask 挂
         new_buy_id = self._place("Bid", target_bid, qty)
         new_sell_id = self._place("Ask", target_ask, qty)
         
-        # ==========================================
-        # 3. 结果校验 (All-or-Nothing)
-        # ==========================================
-        
+        # 3. 结果校验
         if new_buy_id and new_sell_id:
-            # 完美成功
             self.active_buy_id = new_buy_id
             self.active_sell_id = new_sell_id
-            logger.info(f"✅ 挂: 买{target_bid} / 卖{target_ask}")
+            
+            # [新增] 记录挂单详情用于统计
+            self.active_buy_price = target_bid
+            self.active_sell_price = target_ask
+            self.active_buy_qty = qty
+            self.active_sell_qty = qty
+            
+            logger.info(f"✅ 挂: 买{target_bid} / 卖{target_ask} ({qty:.3f})")
             
         elif (new_buy_id and not new_sell_id) or (not new_buy_id and new_sell_id):
-            # 只有一边成功 (例如一边PostOnly失败) -> 立即撤销成功的那个，保持空仓，下一轮再试
             logger.warning("⚠️ 挂单不完整 -> 立即回滚撤单")
             self.cancel_all()
             
         else:
-            # 两边都失败 (可能余额不足或行情剧烈)
             pass
 
     def _logic_unwind(self, best_bid, best_ask):
-        """回本模式：利用买1卖1尽快离场"""
-        
+        """回本模式"""
         timeout = (time.time() - self.unwind_start_time > self.cfg.BREAKEVEN_TIMEOUT)
         
-        # --- 多头平仓 (卖出) ---
+        # 多头平仓
         if self.held_qty > self.min_qty:
             if self.active_buy_id: self.cancel_all()
             
             if not self.active_sell_id:
-                # 目标：成本价 + 1个tick (0手续费模式)
-                # 兜底：不能低于市场价
                 target = max(self.avg_cost + self.tick_size, best_ask)
+                if timeout: target = best_ask 
                 
-                if timeout:
-                    target = best_ask # 超时后贴盘口卖
+                qty = abs(self.held_qty)
+                self.active_sell_id = self._place("Ask", target, qty)
                 
-                self.active_sell_id = self._place("Ask", target, abs(self.held_qty))
+                # [新增] 记录统计信息
+                if self.active_sell_id:
+                    self.active_sell_price = target
+                    self.active_sell_qty = qty
 
-        # --- 空头平仓 (买入) ---
+        # 空头平仓
         elif self.held_qty < -self.min_qty:
             if self.active_sell_id: self.cancel_all()
             
             if not self.active_buy_id:
                 target = min(self.avg_cost - self.tick_size, best_bid)
+                if timeout: target = best_bid
                 
-                if timeout:
-                    target = best_bid
+                qty = abs(self.held_qty)
+                self.active_buy_id = self._place("Bid", target, qty)
                 
-                self.active_buy_id = self._place("Bid", target, abs(self.held_qty))
+                # [新增] 记录统计信息
+                if self.active_buy_id:
+                    self.active_buy_price = target
+                    self.active_buy_qty = qty
