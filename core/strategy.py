@@ -645,7 +645,11 @@ class TickScalper:
                 return
 
             duration = time.time() - self.hold_start_time
-            pnl_pct = (best_bid - self.avg_cost) / self.avg_cost
+            
+            # 基准价格：优先使用最后一次买入价，如果没有(如重启后)则使用平均成本
+            ref_price = self.last_buy_price if self.last_buy_price > 0 else self.avg_cost
+            # 基于“最后一次成交价”计算盈亏比例用于止损判断
+            pnl_pct = (best_bid - ref_price) / ref_price
             
             # 默认：最小利润保护
             min_profit_price = self.avg_cost + self.tick_size
