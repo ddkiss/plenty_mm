@@ -1,357 +1,125 @@
 import time
-from datetime import datetime, timedelta
-from .utils import logger, round_to_step, floor_to
-from .rest_client import BackpackREST
+import requests
+import json
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from .utils import create_signature, logger
 
-class DualMaker:
-    def __init__(self, config):
-        self.cfg = config
-        self.symbol = config.SYMBOL
-        self.rest = BackpackREST(config.API_KEY, config.SECRET_KEY)
+class BackpackREST:
+    def __init__(self, api_key, secret_key, base_url="https://api.backpack.exchange"):
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.base_url = base_url
+        self.session = requests.Session()
         
-        # 市场基础参数
-        self.tick_size = 0.01
-        self.min_qty = 0.1
-        self.base_precision = 2
+        # ==========================================
+        # [配置] API 重试机制
+        # ==========================================
+        retries = Retry(
+            total=3, 
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+            raise_on_status=False
+        )
         
-        # 订单追踪 (核心状态)
-        self.active_buy_id = None
-        self.active_sell_id = None
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def _request(self, method, endpoint, instruction, params=None, data=None):
+        url = f"{self.base_url}{endpoint}"
+        timestamp = str(int(time.time() * 1000))
+        window = "5000"
         
-        # [新增] 记录挂单详情用于统计
-        self.active_buy_qty = 0.0
-        self.active_sell_qty = 0.0
-        self.active_buy_price = 0.0
-        self.active_sell_price = 0.0
-        
-        # 仓位与资产
-        self.held_qty = 0.0
-        self.avg_cost = 0.0
-        self.equity = 0.0
-        
-        # 策略状态
-        self.mode = "DUAL"  # DUAL(双向刷量) / UNWIND(回本/止损)
-        self.last_fill_time = 0 
-        self.unwind_start_time = 0
-        
-        # [新增] 统计数据
-        self.start_time = time.time()
-        self.initial_equity = 0.0 # 初始净值
-        self.stats = {
-            'fill_count': 0,        # 成交次数
-            'total_volume': 0.0,    # 总交易量 (Base Asset)
-            'total_quote_vol': 0.0, # 总交易额 (Quote Asset)
-            'total_fee': 0.0,       # 估算手续费
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-KEY": self.api_key,
+            "X-TIMESTAMP": timestamp,
+            "X-WINDOW": window
         }
 
-    def init_market_info(self):
-        """初始化市场精度信息"""
-        try:
-            markets = self.rest.get_markets()
-            for m in markets:
-                if m['symbol'] == self.symbol:
-                    filters = m['filters']
-                    self.tick_size = float(filters['price']['tickSize'])
-                    self.min_qty = float(filters['quantity']['minQuantity'])
-                    step_size = str(filters['quantity']['stepSize'])
-                    if '.' in step_size:
-                        self.base_precision = len(step_size.split('.')[1])
-                    else:
-                        self.base_precision = 0
-                    logger.info(f"Market Init: Tick={self.tick_size}, MinQty={self.min_qty}")
-                    return
-        except Exception as e:
-            logger.error(f"Init Error: {e}")
-            exit(1)
-
-    def _sync_state(self):
-        """
-        同步状态核心：
-        1. 更新资产和持仓。
-        2. 检查挂单是否存活（以此判断是否成交）。
-        3. [新增] 触发统计打印
-        """
-        try:
-            # 1. 获取净值 (用于计算下单量)
-            col = self.rest.get_collateral()
-            if isinstance(col, dict):
-                current_equity = float(col.get("netEquityAvailable", 0))
-                # 记录初始资金
-                if self.initial_equity == 0 and current_equity > 0:
-                    self.initial_equity = current_equity
-                self.equity = current_equity
-            
-            # 2. 获取持仓 (Perp)
-            positions = self.rest.get_positions(self.symbol)
-            found = False
-            if isinstance(positions, list):
-                for p in positions:
-                    if p.get('symbol') == self.symbol:
-                        self.held_qty = float(p.get('netQuantity', 0))
-                        self.avg_cost = float(p.get('entryPrice', 0))
-                        found = True
-                        break
-            if not found:
-                self.held_qty = 0.0
-                self.avg_cost = 0.0
-
-            # 3. 反推订单状态与统计成交
-            open_orders = self.rest.get_open_orders(self.symbol)
-            if not isinstance(open_orders, list):
-                open_orders = [] 
-            
-            active_ids = {str(o['id']) for o in open_orders}
-            
-            trade_occurred = False
-            
-            # --- 检查买单 ---
-            if self.active_buy_id:
-                if str(self.active_buy_id) not in active_ids:
-                    logger.info(f"🔔 买单已消失(成交/被撤) -> ID: {self.active_buy_id}")
-                    # 更新统计
-                    self._update_stats("Buy", self.active_buy_price, self.active_buy_qty)
-                    self.active_buy_id = None 
-                    self.last_fill_time = time.time()
-                    trade_occurred = True
-            
-            # --- 检查卖单 ---
-            if self.active_sell_id:
-                if str(self.active_sell_id) not in active_ids:
-                    logger.info(f"🔔 卖单已消失(成交/被撤) -> ID: {self.active_sell_id}")
-                    # 更新统计
-                    self._update_stats("Sell", self.active_sell_price, self.active_sell_qty)
-                    self.active_sell_id = None
-                    self.last_fill_time = time.time()
-                    trade_occurred = True
-
-            # 如果发生了成交，打印一次汇总
-            if trade_occurred:
-                self._print_stats()
-
-        except Exception as e:
-            logger.error(f"Sync Error: {e}")
-
-    def _update_stats(self, side, price, qty):
-        """更新内部统计数据"""
-        quote_vol = price * qty
-        fee = quote_vol * self.cfg.TAKER_FEE_RATE # 仅作估算参考
+        # Sign
+        signature_params = params.copy() if params else {}
+        if data:
+            for k, v in data.items():
+                signature_params[k] = str(v).lower() if isinstance(v, bool) else str(v)
         
-        self.stats['fill_count'] += 1
-        self.stats['total_volume'] += qty
-        self.stats['total_quote_vol'] += quote_vol
-        self.stats['total_fee'] += fee
-
-    def _print_stats(self):
-        """[新增] 打印策略运行汇总面板"""
-        try:
-            now = time.time()
-            duration = now - self.start_time
-            run_time_str = str(timedelta(seconds=int(duration)))
-            
-            # 动态计算 PnL
-            current_pnl = 0.0
-            pnl_percent = 0.0
-            if self.initial_equity > 0:
-                current_pnl = self.equity - self.initial_equity
-                pnl_percent = (current_pnl / self.initial_equity) * 100
-
-            # 估算磨损率 (PnL / 成交额)
-            wear_rate = 0.0
-            if self.stats['total_quote_vol'] > 0:
-                wear_rate = (abs(current_pnl) / self.stats['total_quote_vol']) * 100
-
-            beijing_now = datetime.utcnow() + timedelta(hours=8)
-            time_str = beijing_now.strftime('%H:%M:%S')
-
-            msg = (
-                f"\n{'='*4} 📊 策略运行汇总 ({time_str}) {'='*2}\n"
-                f"交易对:   {self.symbol}\n"  # <--- 已添加此行
-                f"运行时间: {run_time_str}\n"
-                f"当前模式: {self.mode}\n"
-                f"---\n"
-                f"初始净值: {self.initial_equity:.2f} USDC\n"
-                f"当前净值: {self.equity:.2f} USDC\n"
-                f"累计盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
-                f"---\n"
-                f"成交次数: {self.stats['fill_count']} 次\n"
-                f"总成交量: {self.stats['total_volume']:.4f}\n"
-                f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"
-                f"估算手续费: {self.stats['total_fee']:.4f} USDC\n"
-                f"资金磨损率: {wear_rate:.4f}%\n"
-                f"{'='*5}\n"
-            )
-            logger.info(msg)
-        except Exception as e:
-            logger.error(f"Print Stats Error: {e}")
-
-    def _place(self, side, price, qty):
-        """下单包装函数：异常不中断，返回 ID 或 None"""
-        price = round_to_step(price, self.tick_size)
-        qty = floor_to(qty, self.base_precision)
+        signature = create_signature(self.secret_key, instruction, signature_params, timestamp, window)
+        if signature:
+            headers["X-SIGNATURE"] = signature
         
-        if qty < self.min_qty: return None
-
         try:
-            res = self.rest.execute_order({
-                "symbol": self.symbol,
-                "side": side,
-                "orderType": "Limit",
-                "price": str(price),
-                "quantity": str(qty),
-                "postOnly": True # 必须 Maker
-            })
-            if "id" in res:
-                return res["id"]
+            if method == "GET":
+                # timeout=(连接超时, 读取超时)
+                resp = self.session.get(url, headers=headers, params=params, timeout=(3.05, 5))
             else:
-                return None
-        except Exception:
+                resp = self.session.post(url, headers=headers, json=data, timeout=(3.05, 5)) if method == "POST" else \
+                       self.session.delete(url, headers=headers, json=data, timeout=(3.05, 5))
+            
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                # === [补回] 特殊处理：如果是 404 且是查询持仓，直接忽略，不打印警告 ===
+                if resp.status_code == 404 and "position" in endpoint:
+                    return {"error": resp.text} 
+                # ==============================================================
+
+                # 其他错误才打印日志
+                logger.warning(f"API Error [{resp.status_code}] {endpoint}: {resp.text[:100]}")
+                return {"error": resp.text}
+                
+        except Exception as e:
+            logger.error(f"Request Exception ({endpoint}): {str(e)}")
+            return {"error": str(e)}
+
+    # 以下方法保持不变
+    def get_balance(self):
+        return self._request("GET", "/api/v1/capital", "balanceQuery")
+
+    def get_collateral(self):
+        return self._request("GET", "/api/v1/capital/collateral", "collateralQuery")
+
+    def get_markets(self):
+        try:
+            return self.session.get(f"{self.base_url}/api/v1/markets", timeout=5).json()
+        except:
+            return []
+
+    def get_depth(self, symbol, limit=5):
+        try:
+            url = f"{self.base_url}/api/v1/depth"
+            params = {"symbol": symbol, "limit": str(limit)}
+            resp = self.session.get(url, params=params, timeout=2)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception as e:
+            logger.error(f"获取深度网络异常: {e}")
             return None
 
-    def cancel_all(self):
-        """安全撤销所有订单"""
-        try:
-            self.rest.cancel_open_orders(self.symbol)
-        except Exception:
-            pass
-        finally:
-            self.active_buy_id = None
-            self.active_sell_id = None
-            # 撤单后不重置 qty/price，防止 _sync_state 在撤单后无法统计到刚结束的订单
-            # (虽然大概率 _sync_state 是下一轮才跑，但保留无害)
+    def execute_order(self, order_data):
+        return self._request("POST", "/api/v1/order", "orderExecute", data=order_data)
 
-    def run(self):
-        self.init_market_info()
-        self.cancel_all()
-        # 更新日志：明确显示当前杠杆和总有效资金估算
-        logger.info(f"🚀 DualMaker V3 启动 | 杠杆: {self.cfg.LEVERAGE}x | 有效资金利用率: {self.cfg.GRID_ORDER_PCT*100}%/单")
+    def cancel_open_orders(self, symbol):
+        return self._request("DELETE", "/api/v1/orders", "orderCancelAll", data={"symbol": symbol})
+
+    def get_open_orders(self, symbol):
+        return self._request("GET", "/api/v1/orders", "orderQueryAll", params={"symbol": symbol})
+    
+    def get_positions(self, symbol=None):
+        params = {}
+        if symbol: params["symbol"] = symbol
+        res = self._request("GET", "/api/v1/position", "positionQuery", params=params)
         
-        while True:
-            time.sleep(0.5) # 轮询间隔
-
-            try:
-                # 1. 同步状态 (内含成交检测与 Stats 打印)
-                self._sync_state()
-
-                # 2. 仓位风控检查
-                exposure = abs(self.held_qty * self.avg_cost)
-                effective_capital = self.equity * self.cfg.LEVERAGE
-                ratio = exposure / effective_capital if effective_capital > 0 else 0
-                
-                if ratio > self.cfg.MAX_POSITION_PCT:
-                    if self.mode == "DUAL":
-                        logger.warning(f"⚠️ 仓位过重 (占比{ratio:.1%} > {self.cfg.MAX_POSITION_PCT*100}%) -> 切换至 UNWIND 回本模式")
-                        self.mode = "UNWIND"
-                        self.cancel_all()
-                        self.unwind_start_time = time.time()
-                elif self.held_qty == 0 and self.mode == "UNWIND":
-                    logger.info("🎉 仓位已清空 -> 恢复 DUAL 模式")
-                    self.mode = "DUAL"
-
-                # 3. 获取并清洗深度数据
-                depth = self.rest.get_depth(self.symbol, limit=5)
-                if not depth: continue
-                
-                bids = sorted(depth.get('bids', []), key=lambda x: float(x[0]), reverse=True)
-                asks = sorted(depth.get('asks', []), key=lambda x: float(x[0]))
-                
-                if len(bids) < 2 or len(asks) < 2: continue
-                
-                # 取买2卖2
-                bid_1 = float(bids[0][0])
-                ask_1 = float(asks[0][0])
-                bid_2 = float(bids[1][0])
-                ask_2 = float(asks[1][0])
-
-                # 4. 执行对应模式逻辑
-                if self.mode == "DUAL":
-                    self._logic_dual(bid_2, ask_2)
-                else:
-                    self._logic_unwind(bid_1, ask_1)
-
-            except Exception as e:
-                logger.error(f"Loop Error: {e}")
-                time.sleep(1)
-
-    def _logic_dual(self, target_bid, target_ask):
-        """双向挂单逻辑 (静默版)"""
-        
-        # 冷却期
-        if time.time() - self.last_fill_time < self.cfg.REBALANCE_WAIT:
-            return
-
-        # 1. 状态检查
-        has_buy = (self.active_buy_id is not None)
-        has_sell = (self.active_sell_id is not None)
-        
-        # 场景 A: 双边都有挂单 -> 不动
-        if has_buy and has_sell:
-            return 
-
-        # 场景 B: 单边挂单 -> 撤单重置
-        if has_buy != has_sell:
-            self.cancel_all()
-            return
-
-        # 2. 空仓开单
-        qty = (self.equity * self.cfg.LEVERAGE * self.cfg.GRID_ORDER_PCT) / target_ask
-        
-        if target_bid >= target_ask: return 
-
-        new_buy_id = self._place("Bid", target_bid, qty)
-        new_sell_id = self._place("Ask", target_ask, qty)
-        
-        # 3. 结果校验
-        if new_buy_id and new_sell_id:
-            self.active_buy_id = new_buy_id
-            self.active_sell_id = new_sell_id
+        # 兼容处理
+        if isinstance(res, dict) and "error" in res:
+            # 这里的 404 已经被 _request 静默处理了，会返回包含 error 的 dict
+            # 我们直接返回空列表，让策略认为无持仓
+            if "404" in str(res.get("code", "")) or "not found" in str(res.get("message", "")).lower():
+                return []
+            return res
             
-            # [新增] 记录挂单详情用于统计
-            self.active_buy_price = target_bid
-            self.active_sell_price = target_ask
-            self.active_buy_qty = qty
-            self.active_sell_qty = qty
-            
-            logger.info(f"✅ 挂: 买{target_bid} / 卖{target_ask} ({qty:.3f})")
-            
-        elif (new_buy_id and not new_sell_id) or (not new_buy_id and new_sell_id):
-            logger.warning("⚠️ 挂单不完整 -> 立即回滚撤单")
-            self.cancel_all()
-            
-        else:
-            pass
-
-    def _logic_unwind(self, best_bid, best_ask):
-        """回本模式"""
-        timeout = (time.time() - self.unwind_start_time > self.cfg.BREAKEVEN_TIMEOUT)
-        
-        # 多头平仓
-        if self.held_qty > self.min_qty:
-            if self.active_buy_id: self.cancel_all()
-            
-            if not self.active_sell_id:
-                target = max(self.avg_cost + self.tick_size, best_ask)
-                if timeout: target = best_ask 
-                
-                qty = abs(self.held_qty)
-                self.active_sell_id = self._place("Ask", target, qty)
-                
-                # [新增] 记录统计信息
-                if self.active_sell_id:
-                    self.active_sell_price = target
-                    self.active_sell_qty = qty
-
-        # 空头平仓
-        elif self.held_qty < -self.min_qty:
-            if self.active_sell_id: self.cancel_all()
-            
-            if not self.active_buy_id:
-                target = min(self.avg_cost - self.tick_size, best_bid)
-                if timeout: target = best_bid
-                
-                qty = abs(self.held_qty)
-                self.active_buy_id = self._place("Bid", target, qty)
-                
-                # [新增] 记录统计信息
-                if self.active_buy_id:
-                    self.active_buy_price = target
-                    self.active_buy_qty = qty
+        if isinstance(res, dict) and "symbol" in res:
+            return [res]
+        return res
