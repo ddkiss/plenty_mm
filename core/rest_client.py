@@ -1,6 +1,8 @@
 import time
 import requests
 import json
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from .utils import create_signature, logger
 
 class BackpackREST:
@@ -9,6 +11,27 @@ class BackpackREST:
         self.secret_key = secret_key
         self.base_url = base_url
         self.session = requests.Session()
+        
+        # ==========================================
+        # [新增] API 重试机制配置
+        # ==========================================
+        # total=3: 遇到特定错误最多重试3次
+        # backoff_factor=0.3: 重试间隔 (0.3s, 0.6s, 1.2s...)
+        # status_forcelist: 遇到 5xx 服务器错误时重试
+        # allowed_methods: 仅允许 GET 请求重试 (防止 POST 下单重试导致重复成交)
+        # ==========================================
+        retries = Retry(
+            total=3, 
+            backoff_factor=0.3,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+            raise_on_status=False
+        )
+        
+        # 将重试策略挂载到 https:// 开头的请求
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def _request(self, method, endpoint, instruction, params=None, data=None):
         url = f"{self.base_url}{endpoint}"
@@ -33,21 +56,28 @@ class BackpackREST:
             headers["X-SIGNATURE"] = signature
         
         try:
+            # timeout=(3.05, 5) 表示连接超时3.05秒，读取超时5秒
+            # 配合上面的 Retry，如果读取超时或连接失败，会自动重试3次
             if method == "GET":
-                resp = self.session.get(url, headers=headers, params=params, timeout=5)
+                resp = self.session.get(url, headers=headers, params=params, timeout=(3.05, 5))
             else:
-                resp = self.session.post(url, headers=headers, json=data, timeout=5) if method == "POST" else \
-                       self.session.delete(url, headers=headers, json=data, timeout=5)
+                # POST/DELETE 不自动重试，避免副作用
+                resp = self.session.post(url, headers=headers, json=data, timeout=(3.05, 5)) if method == "POST" else \
+                       self.session.delete(url, headers=headers, json=data, timeout=(3.05, 5))
             
             if resp.status_code == 200:
                 return resp.json()
             else:
-                logger.warning(f"API Error [{resp.status_code}]: {resp.text}")
+                # 降低日志级别，避免偶尔的 502 刷屏（因为 requests 内部可能已经重试过了）
+                logger.warning(f"API Error [{resp.status_code}] {endpoint}: {resp.text[:100]}")
                 return {"error": resp.text}
+                
         except Exception as e:
-            logger.error(f"Request Exception: {e}")
+            # 只有当重试耗尽(MaxRetryError)或发生其他异常时才会走到这里
+            logger.error(f"Request Exception ({endpoint}): {str(e)}")
             return {"error": str(e)}
 
+    # 以下方法保持不变，直接复用
     def get_balance(self):
         """获取现货余额"""
         return self._request("GET", "/api/v1/capital", "balanceQuery")
@@ -57,27 +87,19 @@ class BackpackREST:
         return self._request("GET", "/api/v1/capital/collateral", "collateralQuery")
 
     def get_markets(self):
-        return requests.get(f"{self.base_url}/api/v1/markets").json()
+        try:
+            return self.session.get(f"{self.base_url}/api/v1/markets", timeout=5).json()
+        except:
+            return []
 
-    # 获取深度数据
     def get_depth(self, symbol, limit=5):
-        """
-        获取盘口深度
-        limit: 限制返回的档位数量，默认为5 (获取最优买卖价只需看第1档，设为5最节省流量)
-        """
         try:
             url = f"{self.base_url}/api/v1/depth"
-            params = {
-                "symbol": symbol, 
-                "limit": str(limit)
-            }
-            # 深度接口通常是公共的，直接请求即可，不需要签名
-            resp = requests.get(url, params=params, timeout=2)
+            params = {"symbol": symbol, "limit": str(limit)}
+            resp = self.session.get(url, params=params, timeout=2) # 深度接口不需要签名，但也享受 Session 的连接池和重试
             if resp.status_code == 200:
                 return resp.json()
-            else:
-                logger.warning(f"获取深度失败 [{resp.status_code}]: {resp.text}")
-                return None
+            return None
         except Exception as e:
             logger.error(f"获取深度网络异常: {e}")
             return None
@@ -92,25 +114,14 @@ class BackpackREST:
         return self._request("GET", "/api/v1/orders", "orderQueryAll", params={"symbol": symbol})
     
     def get_positions(self, symbol=None):
-        """获取永续合约仓位"""
         params = {}
-        if symbol:
-            params["symbol"] = symbol
-
+        if symbol: params["symbol"] = symbol
         res = self._request("GET", "/api/v1/position", "positionQuery", params=params)
         
-        # 特殊处理 404 错误 - 表示没有仓位，返回空列表
         if isinstance(res, dict) and "error" in res:
-            error_msg = str(res["error"])
-            # 检查错误信息中是否包含 404 或 not found
-            if "404" in error_msg or "not found" in error_msg.lower():
-                logger.info(f"仓位查询返回 404，确认无活跃仓位 ({symbol})")
+            if "404" in str(res["error"]) or "not found" in str(res["error"]).lower():
                 return []
-            # 其他错误原样返回
             return res
-
-        # 兼容性处理：如果 API 返回单个字典对象（非列表），将其包装为列表
         if isinstance(res, dict) and "symbol" in res:
             return [res]
-            
         return res
