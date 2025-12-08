@@ -135,7 +135,8 @@ class DualMaker:
     def run(self):
         self.init_market_info()
         self.cancel_all()
-        logger.info(f"🚀 DualMaker V2 启动 | 资金利用率: {self.cfg.GRID_ORDER_PCT*100}%/单 | 买2卖2静默挂单")
+        # 更新日志：明确显示当前杠杆和总有效资金估算
+        logger.info(f"🚀 DualMaker V3 启动 | 杠杆: {self.cfg.LEVERAGE}x | 有效资金利用率: {self.cfg.GRID_ORDER_PCT*100}%/单")
         
         while True:
             time.sleep(0.5) # 轮询间隔
@@ -147,7 +148,10 @@ class DualMaker:
                 # 2. 仓位风控检查
                 # 计算持仓占用 (持仓价值 / 净值)
                 exposure = abs(self.held_qty * self.avg_cost)
-                ratio = exposure / self.equity if self.equity > 0 else 0
+                # [关键修改]：计算杠杆后的“有效总资金”
+                # 如果净值是 100，杠杆是 7，有效资金就是 700
+                effective_capital = self.equity * self.cfg.LEVERAGE
+                ratio = exposure / effective_capital if effective_capital > 0 else 0
                 
                 if ratio > self.cfg.MAX_POSITION_PCT:
                     if self.mode == "DUAL":
