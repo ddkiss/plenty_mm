@@ -163,7 +163,7 @@ class DualMaker:
             # 估算磨损率 (PnL / 成交额)
             wear_rate = 0.0
             if self.stats['total_quote_vol'] > 0:
-                wear_rate = (abs(current_pnl) / self.stats['total_quote_vol']) * 100
+                wear_rate = ((current_pnl) / self.stats['total_quote_vol']) * 100
 
             beijing_now = datetime.utcnow() + timedelta(hours=8)
             time_str = beijing_now.strftime('%H:%M:%S')
