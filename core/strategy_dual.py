@@ -1,5 +1,3 @@
---- START OF FILE plenty_mm-main/core/strategy_dual.py ---
-
 import time
 from datetime import datetime, timedelta
 from .utils import logger, round_to_step, floor_to
