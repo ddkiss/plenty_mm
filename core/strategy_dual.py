@@ -1,3 +1,5 @@
+--- START OF FILE plenty_mm-main/core/strategy_dual.py ---
+
 import time
 from datetime import datetime, timedelta
 from .utils import logger, round_to_step, floor_to
@@ -239,14 +241,20 @@ class DualMaker:
                 effective_capital = self.equity * self.cfg.LEVERAGE
                 ratio = exposure / effective_capital if effective_capital > 0 else 0
                 
+                # --- [模式切换逻辑] ---
                 if ratio > self.cfg.MAX_POSITION_PCT:
                     if self.mode == "DUAL":
                         logger.warning(f"⚠️ 仓位过重 (占比{ratio:.1%} > {self.cfg.MAX_POSITION_PCT*100}%) -> 切换至 UNWIND 回本模式")
                         self.mode = "UNWIND"
                         self.cancel_all()
                         self.unwind_start_time = time.time()
-                elif self.held_qty == 0 and self.mode == "UNWIND":
-                    logger.info("🎉 仓位已清空 -> 恢复 DUAL 模式")
+                
+                # [关键修复]：退出 UNWIND 模式的判断
+                # 1. 使用 abs(self.held_qty) < self.min_qty 来忽略粉尘（例如 0.00001），防止系统因为无法平掉粉尘而死循环。
+                # 2. 增加 self.cancel_all()，确保在切换回 DUAL 前，强制撤销 UNWIND 模式下挂出的平仓单，防止订单残留。
+                elif abs(self.held_qty) < self.min_qty and self.mode == "UNWIND":
+                    logger.info(f"🎉 仓位已清空(或仅剩粉尘 {self.held_qty}) -> 撤单重置 -> 恢复 DUAL 模式")
+                    self.cancel_all() # 核心修复：必须先撤单，再切模式
                     self.mode = "DUAL"
 
                 # 3. 获取并清洗深度数据
