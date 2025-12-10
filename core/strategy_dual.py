@@ -230,7 +230,7 @@ class DualMaker:
         logger.info(f"🚀 DualMaker V3 启动 | 杠杆: {self.cfg.LEVERAGE}x | 有效资金利用率: {self.cfg.GRID_ORDER_PCT*100}%/单")
         
         while True:
-            time.sleep(0.5) # 轮询间隔
+            time.sleep(4.5) # 轮询间隔
 
             try:
                 # 1. 同步状态 (内含成交检测与 Stats 打印)
@@ -274,7 +274,7 @@ class DualMaker:
 
                 # 4. 执行对应模式逻辑
                 if self.mode == "DUAL":
-                    self._logic_dual(bid_2, ask_2)
+                    self._logic_dual(bid_1, ask_1)
                 else:
                     self._logic_unwind(bid_1, ask_1)
 
@@ -286,8 +286,8 @@ class DualMaker:
         """双向挂单逻辑 (静默版)"""
         
         # 冷却期
-        if time.time() - self.last_fill_time < self.cfg.REBALANCE_WAIT:
-            return
+        #if time.time() - self.last_fill_time < self.cfg.REBALANCE_WAIT:
+        #    return
 
         # 1. 状态检查
         has_buy = (self.active_buy_id is not None)
