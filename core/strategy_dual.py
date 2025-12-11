@@ -213,13 +213,15 @@ class DualMaker:
         """安全撤销所有订单"""
         try:
             self.rest.cancel_open_orders(self.symbol)
-        except Exception:
-            pass
-        finally:
+            # 只有 API 调用未抛出异常，才清除本地 ID
             self.active_buy_id = None
             self.active_sell_id = None
-            # 撤单后不重置 qty/price，防止 _sync_state 在撤单后无法统计到刚结束的订单
-            # (虽然大概率 _sync_state 是下一轮才跑，但保留无害)
+        except Exception as e:
+            logger.error(f"⚠️ Cancel All Error: {e} (Local IDs kept for retry)")
+            # 发生异常时不清除 ID，让下一次循环或 _sync_state 再次检查/重试
+            
+        # 撤单后不重置 qty/price，防止 _sync_state 在撤单后无法统计到刚结束的订单
+        # (虽然大概率 _sync_state 是下一轮才跑，但保留无害)
 
     def run(self):
         self.init_market_info()
@@ -336,7 +338,7 @@ class DualMaker:
         # ==========================================
         # 场景 A: 多头平仓 (手里有币，要卖)
         # ==========================================
-        if self.held_qty > self.min_qty:
+        if self.held_qty >= self.min_qty:
             # 1. 必须先撤销反向单 (买单)
             if self.active_buy_id: self.cancel_all()
             
@@ -366,7 +368,7 @@ class DualMaker:
         # ==========================================
         # 场景 B: 空头平仓 (手里欠币，要买)
         # ==========================================
-        elif self.held_qty < -self.min_qty:
+        elif self.held_qty <= -self.min_qty:
             if self.active_sell_id: self.cancel_all()
             
             # 2. [新增] 超时活跃检查
