@@ -86,19 +86,43 @@ class DualMaker:
                 # 更新当前净值
                 self.equity = current_equity
             
-            # 2. 获取持仓 (Perp)
+            # 2. 获取持仓 (兼容 Spot 和 Perp)
+            # 策略：优先尝试获取 Position 信息 (适用于 Perp 和部分 Spot Margin)
+            # 如果没有 Position 信息，且是 Spot Symbol，则回退到余额计算
+            
             positions = self.rest.get_positions(self.symbol)
-            found = False
+            pos_found = False
+            
             if isinstance(positions, list):
                 for p in positions:
                     if p.get('symbol') == self.symbol:
                         self.held_qty = float(p.get('netQuantity', 0))
                         self.avg_cost = float(p.get('entryPrice', 0))
-                        found = True
+                        pos_found = True
                         break
-            if not found:
-                self.held_qty = 0.0
-                self.avg_cost = 0.0
+            
+            if not pos_found:
+                if "PERP" not in self.symbol.upper():
+                    # --- Spot 模式回退逻辑 ---
+                    # 假设 Symbol 格式为 "BASE_QUOTE"，例如 "SOL_USDC"
+                    base_asset = self.symbol.split('_')[0]
+                    balances = self.rest.get_balance()
+                    
+                    if isinstance(balances, dict) and base_asset in balances:
+                        b_info = balances[base_asset]
+                        available = float(b_info.get("available", 0))
+                        locked = float(b_info.get("locked", 0))
+                        # 现货净持仓 = 可用 + 冻结 (若 API 返回负数 available，则自动识别为空头)
+                        self.held_qty = available + locked
+                    else:
+                        self.held_qty = 0.0
+                    
+                    # 现货难以通过简单 API 获取准确的 avg_cost
+                    self.avg_cost = 0.0
+                else:
+                    # --- Perp 模式且无持仓 ---
+                    self.held_qty = 0.0
+                    self.avg_cost = 0.0
 
             # 3. 反推订单状态与统计成交
             open_orders = self.rest.get_open_orders(self.symbol)
@@ -236,8 +260,23 @@ class DualMaker:
                 # 1. 同步状态 (内含成交检测与 Stats 打印)
                 self._sync_state()
 
-                # 2. 仓位风控检查
-                exposure = abs(self.held_qty * self.avg_cost)
+                # 2. 获取并清洗深度数据 (提前至风控前，以便计算市值)
+                depth = self.rest.get_depth(self.symbol, limit=5)
+                if not depth: continue
+                
+                bids = sorted(depth.get('bids', []), key=lambda x: float(x[0]), reverse=True)
+                asks = sorted(depth.get('asks', []), key=lambda x: float(x[0]))
+                
+                if len(bids) < 2 or len(asks) < 2: continue
+                
+                bid_1 = float(bids[0][0])
+                ask_1 = float(asks[0][0])
+                
+                # 3. 仓位风控检查
+                # 如果 avg_cost 为 0 (Spot模式)，则使用当前市价估算持仓价值
+                calc_price = self.avg_cost if self.avg_cost > 0 else (bid_1 + ask_1) / 2
+                exposure = abs(self.held_qty * calc_price)
+                
                 effective_capital = self.equity * self.cfg.LEVERAGE
                 ratio = exposure / effective_capital if effective_capital > 0 else 0
                 
@@ -250,27 +289,10 @@ class DualMaker:
                         self.unwind_start_time = time.time()
                 
                 # [关键修复]：退出 UNWIND 模式的判断
-                # 1. 使用 abs(self.held_qty) < self.min_qty 来忽略粉尘（例如 0.00001），防止系统因为无法平掉粉尘而死循环。
-                # 2. 增加 self.cancel_all()，确保在切换回 DUAL 前，强制撤销 UNWIND 模式下挂出的平仓单，防止订单残留。
                 elif abs(self.held_qty) < self.min_qty and self.mode == "UNWIND":
                     logger.info(f"🎉 仓位已清空(或仅剩粉尘 {self.held_qty}) -> 撤单重置 -> 恢复 DUAL 模式")
                     self.cancel_all() # 核心修复：必须先撤单，再切模式
                     self.mode = "DUAL"
-
-                # 3. 获取并清洗深度数据
-                depth = self.rest.get_depth(self.symbol, limit=5)
-                if not depth: continue
-                
-                bids = sorted(depth.get('bids', []), key=lambda x: float(x[0]), reverse=True)
-                asks = sorted(depth.get('asks', []), key=lambda x: float(x[0]))
-                
-                if len(bids) < 2 or len(asks) < 2: continue
-                
-                # 取买2卖2
-                bid_1 = float(bids[0][0])
-                ask_1 = float(asks[0][0])
-                bid_2 = float(bids[1][0])
-                ask_2 = float(asks[1][0])
 
                 # 4. 执行对应模式逻辑
                 if self.mode == "DUAL":
@@ -335,6 +357,9 @@ class DualMaker:
         # 计算是否超时
         timeout = (time.time() - self.unwind_start_time > self.cfg.BREAKEVEN_TIMEOUT)
         
+        # 若成本为 0 (例如 Spot 模式无法获取 avg_cost)，则强制使用市价(Maker)平仓，不追求保本
+        unknown_cost = (self.avg_cost <= 0)
+
         # ==========================================
         # 场景 A: 多头平仓 (手里有币，要卖)
         # ==========================================
@@ -344,18 +369,18 @@ class DualMaker:
             
             # 2. [新增] 超时活跃检查
             # 如果处于超时状态，且当前有挂单，检查挂单价格是否还是“卖一价”
-            if self.active_sell_id and timeout:
+            if self.active_sell_id and (timeout or unknown_cost):
                 # 如果挂单价与当前卖一价偏差超过半个 tick，说明价格跑了
                 if abs(self.active_sell_price - best_ask) > self.tick_size / 2:
-                    logger.info(f"⏰ 回本超时 -> 价格偏离，撤单重挂紧贴卖一: {best_ask}")
+                    logger.info(f"⏰ 回本超时(或未知成本) -> 价格偏离，撤单重挂紧贴卖一: {best_ask}")
                     self.cancel_all()
                     return # 撤单后直接返回，等下一轮循环重新挂
 
             # 3. 挂单逻辑
             if not self.active_sell_id:
                 # 正常模式：保本出 (成本价+1跳) 和 卖一价，取较大值 (不想亏本)
-                # 超时模式：不看成本了，直接挂 卖一价 (best_ask)，只求成交
-                target = best_ask if timeout else max(self.avg_cost + self.tick_size, best_ask)
+                # 超时/无成本模式：不看成本了，直接挂 卖一价 (best_ask)，只求成交
+                target = best_ask if (timeout or unknown_cost) else max(self.avg_cost + self.tick_size, best_ask)
                 
                 qty = abs(self.held_qty)
                 # 依然保持默认的 Maker 属性 (postOnly=True)
@@ -372,18 +397,18 @@ class DualMaker:
             if self.active_sell_id: self.cancel_all()
             
             # 2. [新增] 超时活跃检查
-            if self.active_buy_id and timeout:
+            if self.active_buy_id and (timeout or unknown_cost):
                 # 如果挂单价与当前买一价不同，撤单重追
                 if abs(self.active_buy_price - best_bid) > self.tick_size / 2:
-                    logger.info(f"⏰ 回本超时 -> 价格偏离，撤单重挂紧贴买一: {best_bid}")
+                    logger.info(f"⏰ 回本超时(或未知成本) -> 价格偏离，撤单重挂紧贴买一: {best_bid}")
                     self.cancel_all()
                     return
 
             # 3. 挂单逻辑
             if not self.active_buy_id:
                 # 正常模式：保本回 (成本价-1跳) 和 买一价，取较小值
-                # 超时模式：不看成本了，直接挂 买一价 (best_bid)
-                target = best_bid if timeout else min(self.avg_cost - self.tick_size, best_bid)
+                # 超时/无成本模式：不看成本了，直接挂 买一价 (best_bid)
+                target = best_bid if (timeout or unknown_cost) else min(self.avg_cost - self.tick_size, best_bid)
                 
                 qty = abs(self.held_qty)
                 self.active_buy_id = self._place("Bid", target, qty)
