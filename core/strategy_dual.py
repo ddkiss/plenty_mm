@@ -369,7 +369,7 @@ class DualMaker:
                         logger.warning(f"⚠️ 仓位过重 ({ratio:.1%}) -> 切换 UNWIND")
                         self.mode = "UNWIND"
                         self.unwind_start_time = time.time()
-                elif abs(self.held_qty) < self.min_qty and self.mode == "UNWIND":
+                elif abs(self.held_qty) <= self.min_qty and self.mode == "UNWIND":
                     logger.info("🎉 仓位回归 -> 切换 DUAL")
                     self.mode = "DUAL"
 
