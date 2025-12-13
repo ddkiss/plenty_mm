@@ -109,8 +109,12 @@ class DualMaker:
                 
                 # 顺便获取当前交易对的持仓
                 if asset.get("symbol") == base_asset:
-                    self.held_qty = float(asset.get("totalQuantity", 0))
+                    # [修复] 计算净持仓: 资产 - 负债 (borrowedQuantity)
+                    qty_total = float(asset.get("totalQuantity", 0))
+                    qty_borrow = float(asset.get("borrowedQuantity", 0))
+                    self.held_qty = qty_total - qty_borrow
                     found_asset = True
+
 
             borrow_liab = float(col.get("borrowLiability", 0)) # 借贷名义价值
             unrealized = float(col.get("pnlUnrealized", 0))    # 合约未实现盈亏
