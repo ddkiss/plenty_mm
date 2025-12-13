@@ -236,7 +236,6 @@ class DualMaker:
             f"当前: {self.real_equity:.2f}\n"
             f"持仓: {self.held_qty:.4f} (均价: {self.avg_cost:.4f})\n"
             f"盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
-            f" 🌟🌟 \n"
             f"成交: {self.stats['fill_count']}次 \n"
             f"成交: {self.stats['total_quote_vol']:.1f} USDC\n"
             f"磨损: {wear_rate:.5f}%\n"
