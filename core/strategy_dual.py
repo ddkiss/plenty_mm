@@ -27,7 +27,10 @@ class DualMaker:
         # 仓位与资产
         self.held_qty = 0.0
         self.avg_cost = 0.0
-        self.equity = 0.0
+        
+        # === [核心修改] 区分 "交易净值" 和 "真实净值" ===
+        self.equity = 0.0       # netEquity (含折扣，用于下单风控)
+        self.real_equity = 0.0  # Real Value (无折扣，用于计算真实盈亏)
         
         # 策略状态
         self.mode = "DUAL"  # DUAL / UNWIND
@@ -36,7 +39,7 @@ class DualMaker:
         
         # 统计数据
         self.start_time = time.time()
-        self.initial_equity = 0.0 
+        self.initial_real_equity = 0.0 # 记录初始的真实净值
         self.stats = {
             'fill_count': 0,
             'total_volume': 0.0,
@@ -74,28 +77,39 @@ class DualMaker:
 
     def _sync_state(self):
         """
-        同步状态核心 (Unified Margin 模式适配):
-        1. 使用 get_collateral 获取统一的 Equity 和 现货持仓。
-        2. 如果是合约，额外通过 get_positions 获取精确的 entryPrice。
+        同步状态核心 (Unified Margin):
+        1. 获取 MarginAccountSummary 对象。
+        2. 提取 netEquity 用于交易风控 (Risk-Adjusted)。
+        3. 提取 assetsValue, borrowLiability, pnlUnrealized 计算真实净值 (No Haircut)。
         """
         try:
             # --- 1. 获取联合保证金账户数据 ---
-            # Backpack 的 Spot 和 Perp 共享 collateral
             col = self.rest.get_collateral()
             
             if not isinstance(col, dict):
                 logger.error(f"获取 Collateral 失败: {col}")
                 return
 
-            # 获取净值 (Net Equity) - 这是所有下单金额的基础
+            # A. 获取交易净值 (含折扣) - 用于计算下单量和交易所风控
             self.equity = float(col.get("netEquity", 0))
-            if self.initial_equity == 0 and self.equity > 0:
-                self.initial_equity = self.equity
+
+            # B. 计算真实净值 (无折扣) - 用于显示盈亏
+            # 严格使用 MarginAccountSummary 字段，不进行手动计算
+            assets_val = float(col.get("assetsValue", 0))       # 现货资产名义价值 (正值)
+            borrow_liab = float(col.get("borrowLiability", 0)) # 借贷名义价值 (正值，代表负债)
+            unrealized = float(col.get("pnlUnrealized", 0))    # 合约未实现盈亏 (可正可负)
+            
+            # Real Equity = 资产总值 - 负债总值 + 未实现盈亏
+            self.real_equity = assets_val - borrow_liab + unrealized
+
+            # 记录初始资金 (只记录一次，且必须大于0)
+            if self.initial_real_equity == 0 and self.real_equity > 0:
+                self.initial_real_equity = self.real_equity
+                logger.info(f"💰 初始真实本金记录: {self.initial_real_equity:.2f} USDC (无折扣市值)")
 
             # --- 2. 获取持仓数量 (Held Qty) ---
             if self.is_perp:
                 # === 合约模式 ===
-                # 合约持仓推荐使用 get_positions，因为包含 entryPrice 和 leverage 信息
                 positions = self.rest.get_positions(self.symbol)
                 pos_found = False
                 if isinstance(positions, list):
@@ -110,27 +124,22 @@ class DualMaker:
                     self.avg_cost = 0.0
             else:
                 # === 现货模式 (Unified) ===
-                # 现货持仓在 collateral 的 'assets' 列表中
-                assets = col.get("assets", [])
-                base_asset = self.symbol.split('_')[0] # 例如 SOL_USDC -> SOL
+                collateral_list = col.get("collateral", [])
+                base_asset = self.symbol.split('_')[0] 
                 
                 found_asset = False
-                for asset in assets:
+                for asset in collateral_list:
                     if asset.get("symbol") == base_asset:
-                        # 现货总持仓 = 可用 + 冻结
-                        avail = float(asset.get("available", 0))
-                        locked = float(asset.get("locked", 0))
-                        # 借贷情况处理：如果有借款，borrow 字段可能会有值，这里取净值
-                        borrow = float(asset.get("borrow", 0))
-                        
-                        self.held_qty = avail + locked - borrow
+                        # 现货持仓 = totalQuantity (API文档显示这是未打折的总量)
+                        # totalQuantity = available + locked + staked
+                        self.held_qty = float(asset.get("totalQuantity", 0))
                         found_asset = True
                         break
                 
                 if not found_asset:
                     self.held_qty = 0.0
                 
-                # 现货成本估算：如果没有 avg_cost (API不提供)，则暂时用当前盘口价或上次成交价估算
+                # 现货成本估算
                 if self.avg_cost == 0 and self.active_buy_price > 0:
                     self.avg_cost = self.active_buy_price
 
@@ -175,6 +184,7 @@ class DualMaker:
         self.stats['total_fee'] += fee
 
     def _print_stats(self):
+        """打印统计信息，使用真实净值(Real Equity)计算盈亏"""
         try:
             now = time.time()
             duration = now - self.start_time
@@ -182,9 +192,11 @@ class DualMaker:
             
             current_pnl = 0.0
             pnl_percent = 0.0
-            if self.initial_equity > 0:
-                current_pnl = self.equity - self.initial_equity
-                pnl_percent = (current_pnl / self.initial_equity) * 100
+            
+            # 使用无折扣的 Real Equity 计算盈亏
+            if self.initial_real_equity > 0:
+                current_pnl = self.real_equity - self.initial_real_equity
+                pnl_percent = (current_pnl / self.initial_real_equity) * 100
 
             wear_rate = 0.0
             if self.stats['total_quote_vol'] > 0:
@@ -194,17 +206,18 @@ class DualMaker:
             time_str = beijing_now.strftime('%H:%M:%S')
 
             msg = (
-                f"\n{'='*3} 📊 策略运行汇总 {'='*3}\n"
+                f"\n{'='*3} 📊 策略运行汇总 ({time_str}) {'='*3}\n"
                 f"模式: {self.symbol} (Unified) | {self.mode}\n"
-                f"初始净值: {self.initial_equity:.2f}\n"
-                f"当前净值: {self.equity:.2f} USDC\n"
+                f"初始本金: {self.initial_real_equity:.2f} USDC\n"
+                f"真实净值: {self.real_equity:.2f} USDC (准确盈亏)\n"
+                f"交易净值: {self.equity:.2f} USDC (风控/下单)\n"
                 f"累计盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
                 f"-------\n"
-                f"累计运行:{duration_str}\n"
+                f"累计运行: {duration_str}\n"
                 f"成交次数: {self.stats['fill_count']} 次\n"
                 f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"             
                 f"资金磨损: {wear_rate:.4f}%\n"
-                f"{'='*5} 当前时间:{time_str} ==\n "
+                f"{'='*5}\n "
             )
             logger.info(msg)
         except Exception as e:
@@ -227,11 +240,9 @@ class DualMaker:
                 "postOnly": True 
             }
 
-            # === [关键修改] 现货模式必须开启自动借贷参数才能裸卖 ===
+            # 现货模式必须开启自动借贷参数才能裸卖 (Auto Borrow)
             if not self.is_perp:
-                # autoBorrow: 允许余额不足时自动借币（用于裸卖空或杠杆买入）
                 payload["autoBorrow"] = True
-                # autoBorrowRepay: 允许成交后自动偿还之前的借贷（用于平仓）
                 payload["autoBorrowRepay"] = True
 
             res = self.rest.execute_order(payload)
@@ -240,7 +251,6 @@ class DualMaker:
                 return res["id"]
             else:
                 msg = res.get("message", str(res))
-                # 过滤掉一些常见的非致命错误日志，避免刷屏
                 if "insufficient" in msg.lower():
                     logger.warning(f"⚠️ 资金不足无法下单 (AutoBorrow已开) [{side}]: {msg[:100]}")
                 else:
@@ -263,7 +273,7 @@ class DualMaker:
         self.cancel_all()
         # 强制同步一次状态以获取初始 Equity
         self._sync_state()
-        logger.info(f"🚀 DualMaker V3 (Unified) 启动 | 净值: {self.equity:.2f} | 杠杆: {self.cfg.LEVERAGE}x")
+        logger.info(f"🚀 DualMaker V3 (Unified) 启动 | 真实净值: {self.real_equity:.2f} | 杠杆: {self.cfg.LEVERAGE}x")
         
         while True:
             time.sleep(4.5) 
@@ -286,6 +296,7 @@ class DualMaker:
                 calc_price = self.avg_cost if self.avg_cost > 0 else (bid_1 + ask_1) / 2
                 exposure = abs(self.held_qty * calc_price)
                 
+                # [注意] 风控比例计算依然使用 self.equity (netEquity)，因为交易所也是按这个来爆仓的
                 effective_capital = self.equity * self.cfg.LEVERAGE
                 if effective_capital <= 0: effective_capital = 1
                 
@@ -294,7 +305,7 @@ class DualMaker:
                 # 仓位过重 -> 回本模式
                 if ratio > self.cfg.MAX_POSITION_PCT:
                     if self.mode == "DUAL":
-                        logger.warning(f"⚠️ 仓位过重 ({ratio:.1%}) -> UNWIND 模式")
+                        logger.warning(f"⚠️ 仓位过重 ({ratio:.1%} 风险权益) -> UNWIND 模式")
                         self.mode = "UNWIND"
                         self.cancel_all()
                         self.unwind_start_time = time.time()
@@ -327,18 +338,13 @@ class DualMaker:
             self.cancel_all()
             return
 
-        # 计算下单金额：基于 netEquity
+        # 计算下单金额：基于 netEquity (交易所认可的保证金)
         raw_qty = (self.equity * self.cfg.LEVERAGE * self.cfg.GRID_ORDER_PCT) / target_ask
         
-        # 数量修正
         if raw_qty < self.min_qty: 
-            return # 资金太少不足以开单
+            return 
             
         if target_bid >= target_ask: return 
-
-        # Unified 模式下，直接尝试双向开单
-        # 如果 BP 支持现货裸空 (Unified Margin)，这里卖单会成功
-        # 如果资金不足，_place 会捕获错误并打印，不影响下一轮重试
         
         new_buy_id = self._place("Bid", target_bid, raw_qty)
         new_sell_id = self._place("Ask", target_ask, raw_qty)
@@ -360,49 +366,40 @@ class DualMaker:
         """回本模式"""
         timeout = (time.time() - self.unwind_start_time > self.cfg.BREAKEVEN_TIMEOUT)
         
-        # === 计算基于总净值的回本价格 (Unified) ===
-        # 目标: 平仓后 Equity >= Initial Equity
-        mid_price = (best_bid + best_ask) / 2
+        # === 计算回本价格 (基于真实净值) ===
+        # 目标: 平仓后 Real Equity >= Initial Real Equity
         break_even_price = 0.0
         use_be_price = False
 
-        if self.initial_equity > 0 and abs(self.held_qty) > self.min_qty:
+        if self.initial_real_equity > 0 and abs(self.held_qty) > self.min_qty:
             try:
-                # 估算除去当前持仓后的剩余净值 (假设当前持仓价值被剥离)
+                # 估算除去当前持仓后的剩余真实余额
+                mid_price = (best_bid + best_ask) / 2
                 current_pos_value = self.held_qty * mid_price
-                estimated_balance = self.equity - current_pos_value
+                estimated_balance = self.real_equity - current_pos_value
                 
-                if self.held_qty > 0: # 多头
-                    # 卖出得到的钱 + 余额 >= 初始净值
-                    # Q * P * (1-fee) + Balance = Init
-                    # P = (Init - Balance) / (Q * (1-fee))
-                    numerator = self.initial_equity - estimated_balance
+                if self.held_qty > 0: # 多头持仓，计算卖出价格
+                    # 目标: estimated_balance + (Qty * Price * (1-fee)) = Initial
+                    numerator = self.initial_real_equity - estimated_balance
                     denominator = self.held_qty * (1 - self.cfg.TAKER_FEE_RATE)
                     if denominator != 0:
                         break_even_price = numerator / denominator
                         use_be_price = True
-                else: # 空头
-                    # 买入花费的钱，使得剩余余额 >= 初始净值
-                    # Balance - Q_buy * P * (1+fee) = Init
-                    # Q_buy * P * (1+fee) = Balance - Init
-                    # P = (Balance - Init) / (abs(Q) * (1+fee))
-                    numerator = estimated_balance - self.initial_equity
+                else: # 空头持仓，计算买入价格
+                    # 目标: estimated_balance - (abs(Qty) * Price * (1+fee)) = Initial
+                    numerator = estimated_balance - self.initial_real_equity
                     denominator = abs(self.held_qty) * (1 + self.cfg.TAKER_FEE_RATE)
                     if denominator != 0:
                         break_even_price = numerator / denominator
                         use_be_price = True
                 
-                if use_be_price:
-                    logger.info(f"🧐 回本计算: 净值{self.equity:.2f} 初始{self.initial_equity:.2f} 持仓{self.held_qty:.4f} -> 目标价 {break_even_price:.4f}")
-
             except Exception as e:
                 logger.error(f"Calc BE Price Error: {e}")
 
-        # A: 多头平仓 (手里有币，要卖)
+        # A: 多头平仓
         if self.held_qty >= self.min_qty:
             if self.active_buy_id: self.cancel_all()
             
-            # 价格策略: 如果有回本价，取 max(回本价, 市场价)；否则 fallback 到市场价或原成本价
             target = best_ask
             if not timeout:
                 if use_be_price and break_even_price > 0:
@@ -411,8 +408,7 @@ class DualMaker:
                     target = max(self.avg_cost + self.tick_size, best_ask)
 
             if self.active_sell_id:
-                # 如果价格偏离过大则撤单重挂
-                if abs(self.active_sell_price - target) > self.tick_size: # 稍微放宽一点检查阈值
+                if abs(self.active_sell_price - target) > self.tick_size:
                     self.cancel_all()
                     return
 
@@ -423,7 +419,7 @@ class DualMaker:
                     self.active_sell_price = target
                     self.active_sell_qty = qty
 
-        # B: 空头平仓 (手里欠币，要买)
+        # B: 空头平仓
         elif self.held_qty <= -self.min_qty:
             if self.active_sell_id: self.cancel_all()
             
