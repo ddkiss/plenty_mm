@@ -240,9 +240,11 @@ class DualMaker:
         msg = (
             f"\n{'='*3} 📊 策略运行汇总 ({time_str}) {'='*3}\n"
             f"模式: {self.symbol} | {self.mode}\n"
-            f"初始: {self.initial_real_equity:.2f} | 当前: {self.real_equity:.2f}\n"
+            f"初始: {self.initial_real_equity:.2f}\n"
+            f"当前: {self.real_equity:.2f}\n"
             f"持仓: {self.held_qty:.4f} (均价: {self.avg_cost:.4f})\n"
             f"盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
+            f"\n{ 🌟🌟 \n"
             f"成交: {self.stats['fill_count']}次 \n"
             f"成交: {self.stats['total_quote_vol']:.1f} USDC\n"
             f"磨损: {wear_rate:.5f}%\n"
