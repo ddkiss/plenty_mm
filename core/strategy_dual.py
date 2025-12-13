@@ -178,6 +178,7 @@ class DualMaker:
         try:
             now = time.time()
             duration = now - self.start_time
+            duration_str = str(timedelta(seconds=int(duration)))
             
             current_pnl = 0.0
             pnl_percent = 0.0
@@ -193,13 +194,14 @@ class DualMaker:
             time_str = beijing_now.strftime('%H:%M:%S')
 
             msg = (
-                f"\n{'='*3} 📊 策略运行汇总 ({time_str}) {'='*3}\n"
+                f"\n{'='*3} 📊 策略运行汇总 {'='*3}\n"
+                f"当前时间:{time_str}\n"
                 f"模式: {self.symbol} (Unified) | {self.mode}\n"
                 f"当前净值: {self.equity:.2f} USDC (初始 {self.initial_equity:.2f})\n"
                 f"累计盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
-                f"---\n"
+                f"-------\n"
                 f"成交次数: {self.stats['fill_count']} 次\n"
-                f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"             
+                f"总成交额: {self.stats['total_quote_vol']:.2f} USDC (累计运行{duration_str}）\n"             
                 f"资金磨损: {wear_rate:.4f}%\n"
                 f"{'='*5}\n"
             )
