@@ -69,13 +69,13 @@ class DualMaker:
             exit(1)
 
     # ============================================================
-    # 阶段 1: 检查上一轮订单 (在撤单前执行)
+    # 阶段 1: 检查成交与状态 (轻量级)
     # ============================================================
-    def _check_previous_orders(self):
+    def _check_and_update_fills(self, open_orders):
         """
-        检查上一轮挂单是否成交
-        Returns:
-            bool: True if trade occurred, False otherwise
+        基于传入的 open_orders 快照判断是否有成交。
+        如果有成交，更新统计数据和成本。
+        Returns: True (有成交) / False (无成交)
         """
         trade_occurred = False
         
@@ -83,23 +83,19 @@ class DualMaker:
             return False
 
         try:
-            # 获取当前挂单列表
-            open_orders = self.rest.get_open_orders(self.symbol)
-            if not isinstance(open_orders, list):
-                open_orders = []
-            
+            # 提取当前存活的订单 ID 集合
             active_ids = {str(o['id']) for o in open_orders}
             
             # 1. 检查买单
             if self.active_buy_id:
                 if str(self.active_buy_id) not in active_ids:
-                    # 订单消失，视为成交 (简化逻辑)
+                    # 订单消失 -> 视为成交
                     logger.info(f"🔔 买单已成交 (ID: {self.active_buy_id})")
                     trade_occurred = True
                     
                     # 现货成本更新 (加权平均)
                     if not self.is_perp:
-                        prev_qty = max(0, self.held_qty) # 上一轮的持仓
+                        prev_qty = max(0, self.held_qty) 
                         fill_qty = self.active_buy_qty
                         fill_price = self.active_buy_price
                         
@@ -112,6 +108,7 @@ class DualMaker:
                             self.avg_cost = fill_price
 
                     self._update_stats("Buy", self.active_buy_price, self.active_buy_qty)
+                    self.active_buy_id = None # 标记为空，防止重复统计
             
             # 2. 检查卖单
             if self.active_sell_id:
@@ -119,12 +116,10 @@ class DualMaker:
                     logger.info(f"🔔 卖单已成交 (ID: {self.active_sell_id})")
                     trade_occurred = True
                     self._update_stats("Sell", self.active_sell_price, self.active_sell_qty)
+                    self.active_sell_id = None
 
         except Exception as e:
             logger.error(f"Check Order Error: {e}")
-        finally:
-            self.active_buy_id = None
-            self.active_sell_id = None
             
         return trade_occurred
 
@@ -170,7 +165,7 @@ class DualMaker:
                             found_qty = True
                             break
             else:
-                # 现货: 使用 borrowLend 获取净持仓 (资产 - 负债)
+                # 现货: 使用 borrowLend 获取净持仓
                 bl_positions = self.rest.get_borrow_lend_positions()
                 if isinstance(bl_positions, list):
                     for p in bl_positions:
@@ -179,7 +174,7 @@ class DualMaker:
                             found_qty = True
                             break
                 
-                # Fallback: 如果没有借贷记录，查 collateral
+                # Fallback
                 if not found_qty:
                     for asset in collateral_list:
                         if asset.get("symbol", "").upper() == base_asset:
@@ -234,7 +229,6 @@ class DualMaker:
         beijing_now = datetime.utcnow() + timedelta(hours=8)
         time_str = beijing_now.strftime('%H:%M:%S')
 
-        # [Custom] 用户定制的汇总格式
         msg = (
             f"\n{'='*3} 📊 策略运行汇总 ({time_str}) {'='*3}\n"
             f"模式: {self.symbol} | {self.mode}\n"
@@ -254,6 +248,9 @@ class DualMaker:
     def cancel_all(self):
         try:
             self.rest.cancel_open_orders(self.symbol)
+            # 撤单后清空本地记录，确保下次状态纯净
+            self.active_buy_id = None
+            self.active_sell_id = None
         except Exception as e:
             logger.error(f"Cancel Error: {e}")
 
@@ -280,6 +277,7 @@ class DualMaker:
                 return res["id"]
             else:
                 msg = res.get("message", str(res))
+                # 忽略一些常见错误
                 if "insufficient" not in msg.lower():
                     logger.warning(f"⚠️ 下单失败: {msg}")
                 return None
@@ -287,17 +285,16 @@ class DualMaker:
             return None
 
     # ============================================================
-    # 主循环逻辑
+    # 主循环逻辑 (优化版: 动静结合)
     # ============================================================
     def run(self):
         self.init_market_info()
         
-        # 启动前清理一次
+        # 启动前先清理并同步一次
         self.cancel_all()
         time.sleep(1)
         self._sync_clean_state()
         
-        # 现货成本兜底
         if not self.is_perp and self.held_qty > self.min_qty and self.avg_cost == 0:
             depth = self.rest.get_depth(self.symbol, limit=1)
             if depth: self.avg_cost = float(depth['bids'][0][0])
@@ -306,37 +303,65 @@ class DualMaker:
 
         while True:
             try:
-                # 1. 检查上一轮成交 (Order Check)
-                # 返回 True 表示有成交
-                trade_happened = self._check_previous_orders()
-
-                # 2. 强制清场 (Cancel) - 确保计算时无挂单/无预借
-                self.cancel_all()
-                
-                # 3. 等待交易所状态回正 (Sleep)
-                time.sleep(0.8) 
-
-                # 4. 获取纯净状态 (Sync)
-                self._sync_clean_state()
-                
-                # 只有发生交易时才打印汇总
-                if trade_happened:
-                    self._print_stats()
-
-                # 5. 获取行情
+                # 1. 获取行情 (用于判断是否需要调价)
                 depth = self.rest.get_depth(self.symbol, limit=5)
-                if not depth: continue
+                if not depth: 
+                    time.sleep(1)
+                    continue
+                
                 bids = sorted(depth.get('bids', []), key=lambda x: float(x[0]), reverse=True)
                 asks = sorted(depth.get('asks', []), key=lambda x: float(x[0]))
                 if len(bids) < 2 or len(asks) < 2: continue
                 bid_1, ask_1 = float(bids[0][0]), float(asks[0][0])
 
-                # 6. 风控与模式切换
+                # 2. 获取当前挂单 (Snapshot)
+                open_orders = self.rest.get_open_orders(self.symbol)
+                if not isinstance(open_orders, list): open_orders = []
+
+                # 3. 检查成交 (Order Check)
+                trade_happened = self._check_and_update_fills(open_orders)
+
+                # 4. 决策: 是否需要重置订单? (Rebalance Check)
+                needs_rebalance = False
+                
+                # 条件A: 发生成交 -> 必须重置以更新仓位
+                if trade_happened:
+                    needs_rebalance = True
+                
+                # 条件B: 当前无挂单 (但应该有) -> 必须挂单
+                # 注意: 如果是 DUAL 模式，应该双边都有；如果是 UNWIND，至少有一边
+                elif self.mode == "DUAL" and (not self.active_buy_id or not self.active_sell_id):
+                    needs_rebalance = True
+                
+                # 条件C: 价格偏离 (Price Drift) -> 需要追单
+                # 如果当前挂单价格 与 市场最优价 偏差超过 1.5个 Tick，则重置
+                else:
+                    if self.active_buy_id and abs(self.active_buy_price - bid_1) > self.tick_size * 1.5:
+                        needs_rebalance = True
+                    if self.active_sell_id and abs(self.active_sell_price - ask_1) > self.tick_size * 1.5:
+                        needs_rebalance = True
+
+                # 5. 执行逻辑
+                if not needs_rebalance:
+                    # 如果不需要重置，就静默待机
+                    time.sleep(0.5)
+                    continue
+                
+                # --- 进入重置流程 (Cancel -> Sync -> Place) ---
+                
+                self.cancel_all()     # 1. 强制清场
+                time.sleep(0.8)       # 2. 等待结算
+                self._sync_clean_state() # 3. 获取纯净状态
+                
+                # 仅在有成交触发时打印汇总
+                if trade_happened:
+                    self._print_stats()
+
+                # 风控检查 (Position Control)
                 mid_price = (bid_1 + ask_1) / 2
                 exposure = abs(self.held_qty * mid_price)
-                effective_capital = self.equity * self.cfg.LEVERAGE # 杠杆基于风险权益
+                effective_capital = self.equity * self.cfg.LEVERAGE 
                 if effective_capital <= 0: effective_capital = 1
-                
                 ratio = exposure / effective_capital
                 
                 if ratio > self.cfg.MAX_POSITION_PCT:
@@ -348,13 +373,13 @@ class DualMaker:
                     logger.info("🎉 仓位回归 -> 切换 DUAL")
                     self.mode = "DUAL"
 
-                # 7. 计算并挂单 (Calculate & Place)
+                # 计算并挂单
                 if self.mode == "DUAL":
                     self._logic_dual(bid_1, ask_1)
                 else:
                     self._logic_unwind(bid_1, ask_1)
 
-                # 8. 挂单持续时间 (Wait)
+                # 挂单后短暂等待
                 time.sleep(self.cfg.REBALANCE_WAIT)
 
             except Exception as e:
