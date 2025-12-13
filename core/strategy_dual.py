@@ -214,25 +214,32 @@ class DualMaker:
         if qty < self.min_qty: return None
 
         try:
-            # 统一使用 Limit 挂单
-            # Backpack Unified 模式下，只要净值足够，现货卖单如果没货会自动借币(如果开启了自动借币)
-            # 或者直接走联合保证金逻辑
-            res = self.rest.execute_order({
+            # 基础下单参数
+            payload = {
                 "symbol": self.symbol,
                 "side": side,
                 "orderType": "Limit",
                 "price": str(price),
                 "quantity": str(qty),
                 "postOnly": True 
-            })
+            }
+
+            # === [关键修改] 现货模式必须开启自动借贷参数才能裸卖 ===
+            if not self.is_perp:
+                # autoBorrow: 允许余额不足时自动借币（用于裸卖空或杠杆买入）
+                payload["autoBorrow"] = True
+                # autoBorrowRepay: 允许成交后自动偿还之前的借贷（用于平仓）
+                payload["autoBorrowRepay"] = True
+
+            res = self.rest.execute_order(payload)
             
             if "id" in res:
                 return res["id"]
             else:
-                # 捕获 "Insufficient funds" 或其他错误，只打印不崩溃
                 msg = res.get("message", str(res))
+                # 过滤掉一些常见的非致命错误日志，避免刷屏
                 if "insufficient" in msg.lower():
-                    logger.warning(f"⚠️ 资金不足无法下单 [{side}]: {msg[:100]}")
+                    logger.warning(f"⚠️ 资金不足无法下单 (AutoBorrow已开) [{side}]: {msg[:100]}")
                 else:
                     logger.warning(f"⚠️ 下单失败 [{side}]: {msg}")
                 return None
