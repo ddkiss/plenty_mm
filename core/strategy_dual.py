@@ -72,46 +72,67 @@ class DualMaker:
 
     def _sync_state(self):
         """
-        同步状态核心:
-        1. 计算真实净值 (Real Equity)。
-        2. 更新持仓 (Held Qty)。
+        同步状态核心 (Unified Margin):
+        1. 获取 netEquity 用于交易风控。
+        2. 遍历 collateral 累加 balanceNotional 计算真实净值。
+        3. 检测成交并更新现货成本 (Weighted Avg)。
         """
         try:
+            # --- 1. 获取联合保证金账户数据 ---
             col = self.rest.get_collateral()
             if not isinstance(col, dict):
                 logger.error(f"获取 Collateral 失败: {col}")
                 return
 
-            # A. 交易净值 (Risk-Adjusted, 用于风控)
+            # A. 获取交易净值 (含折扣)
             self.equity = float(col.get("netEquity", 0))
 
-            # B. 真实净值 (No Haircut, 用于盈亏计算)
+            # B. 计算真实净值 (无折扣)
             collateral_list = col.get("collateral", [])
             total_assets_notional = 0.0
             
-            base_asset = self.symbol.split('_')[0] 
+            # [修复] 强制转换为大写，确保匹配准确
+            base_asset = self.symbol.split('_')[0].upper()
             found_asset = False
+            
+            # [调试] 如果持仓一直不动，开启下面这行注释查看 API 返回了什么
+            # logger.info(f"🔍 寻找资产: {base_asset} | 当前列表: {[a.get('symbol') for a in collateral_list]}")
 
             for asset in collateral_list:
-                # 累加 balanceNotional (Index Price * Balance)
+                # 累加每个资产的真实名义价值
                 total_assets_notional += float(asset.get("balanceNotional", 0))
                 
-                # 获取当前交易对持仓
-                if asset.get("symbol") == base_asset:
+                # 获取当前交易对的持仓
+                # [修复] 这里的 asset.get('symbol') 也要对比大写
+                asset_symbol = asset.get("symbol", "").upper()
+                
+                if asset_symbol == base_asset:
+                    # 净持仓 = 总资产 - 借贷
                     qty_total = float(asset.get("totalQuantity", 0))
                     qty_borrow = float(asset.get("borrowedQuantity", 0))
-                    self.held_qty = qty_total - qty_borrow
+                    
+                    new_held_qty = qty_total - qty_borrow
+                    
+                    # 仅当数量发生显著变化时才打印日志，避免刷屏
+                    if abs(new_held_qty - self.held_qty) > self.min_qty:
+                        logger.info(f"📦 持仓更新 ({base_asset}): {self.held_qty:.4f} -> {new_held_qty:.4f}")
+                        
+                    self.held_qty = new_held_qty
                     found_asset = True
 
             borrow_liab = float(col.get("borrowLiability", 0)) 
             unrealized = float(col.get("pnlUnrealized", 0))    
             
+            # Real Equity = 真实资产总值 - 负债总值 + 未实现盈亏
             self.real_equity = total_assets_notional - borrow_liab + unrealized
 
+            # 如果没找到持仓，且非合约，置0
             if not found_asset and not self.is_perp:
+                if self.held_qty != 0:
+                    logger.info(f"🧹 资产 {base_asset} 不在抵押品列表中，持仓归零")
                 self.held_qty = 0.0
             
-            # 合约持仓修正
+            # 合约持仓单独获取 (补充 entryPrice)
             if self.is_perp:
                 positions = self.rest.get_positions(self.symbol)
                 found_pos = False
@@ -119,38 +140,62 @@ class DualMaker:
                     for p in positions:
                         if p.get('symbol') == self.symbol:
                             self.held_qty = float(p.get('netQuantity', 0))
+                            self.avg_cost = float(p.get('entryPrice', 0))
                             found_pos = True
                             break
                 if not found_pos:
                     self.held_qty = 0.0
+                    self.avg_cost = 0.0
 
             # 记录初始资金
             if self.initial_real_equity == 0 and self.real_equity > 0:
                 self.initial_real_equity = self.real_equity
-                logger.info(f"💰 初始真实本金记录: {self.initial_real_equity:.2f} USDC")
+                logger.info(f"💰 初始真实本金记录: {self.initial_real_equity:.2f} USDC (无折扣市值)")
 
-            # --- 3. 反推订单状态 ---
+            # --- 3. 反推订单状态与更新成本 (现货) ---
             open_orders = self.rest.get_open_orders(self.symbol)
             if not isinstance(open_orders, list):
                 open_orders = [] 
             
             active_ids = {str(o['id']) for o in open_orders}
             
-            # 检查买单
-            if self.active_buy_id:
-                if str(self.active_buy_id) not in active_ids:
-                    self._update_stats("Buy", self.active_buy_price, self.active_buy_qty)
-                    self.active_buy_id = None 
-                    self.last_fill_time = time.time()
-                    self._print_stats()
+            # 检查买单成交 (更新现货成本)
+            if self.active_buy_id and str(self.active_buy_id) not in active_ids:
+                fill_qty = self.active_buy_qty
+                fill_price = self.active_buy_price
+                logger.info(f"🔔 买单结束/成交 (ID: {self.active_buy_id})")
+                
+                # 现货成本加权平均
+                if not self.is_perp:
+                    # 注意：此时 self.held_qty 已经在上面通过 API 更新为最新值了
+                    # 我们需要反推成交前的数量来计算加权
+                    prev_qty = max(0, self.held_qty - fill_qty)
+                    
+                    if self.held_qty > 0:
+                        new_avg = ((prev_qty * self.avg_cost) + (fill_qty * fill_price)) / self.held_qty
+                        logger.info(f"📊 现货成本更新: {self.avg_cost:.4f} -> {new_avg:.4f}")
+                        self.avg_cost = new_avg
+                    else:
+                        self.avg_cost = fill_price
 
-            # 检查卖单
-            if self.active_sell_id:
-                if str(self.active_sell_id) not in active_ids:
-                    self._update_stats("Sell", self.active_sell_price, self.active_sell_qty)
-                    self.active_sell_id = None
-                    self.last_fill_time = time.time()
-                    self._print_stats()
+                self._update_stats("Buy", fill_price, fill_qty)
+                self.active_buy_id = None 
+                self.last_fill_time = time.time()
+                self._print_stats() # 成交后立即打印一次状态
+
+            # 检查卖单成交
+            if self.active_sell_id and str(self.active_sell_id) not in active_ids:
+                logger.info(f"🔔 卖单结束/成交 (ID: {self.active_sell_id})")
+                
+                # 现货清仓重置
+                if not self.is_perp and abs(self.held_qty) < self.min_qty:
+                    self.avg_cost = 0.0
+                    logger.info("🧹 现货已清仓，成本重置为 0")
+
+                self._update_stats("Sell", self.active_sell_price, self.active_sell_qty)
+                self.active_sell_id = None
+                self.last_fill_time = time.time()
+                self._print_stats()
 
         except Exception as e:
             logger.error(f"Sync Error: {e}")
