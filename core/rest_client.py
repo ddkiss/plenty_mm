@@ -107,6 +107,11 @@ class BackpackREST:
     def get_open_orders(self, symbol):
         return self._request("GET", "/api/v1/orders", "orderQueryAll", params={"symbol": symbol})
     
+    # === [新增] 获取现货借贷持仓 ===
+    def get_borrow_lend_positions(self):
+        """获取现货杠杆持仓 (Unified Spot)"""
+        return self._request("GET", "/api/v1/borrowLend/positions", "borrowLendPositionQuery")
+        
     def get_positions(self, symbol=None):
         params = {}
         if symbol: params["symbol"] = symbol
