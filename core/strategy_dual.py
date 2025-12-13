@@ -218,28 +218,35 @@ class DualMaker:
 
     def _print_stats(self):
         now = time.time()
-        # 计算总运行时间
         duration = now - self.start_time
         duration_str = str(timedelta(seconds=int(duration)))
         
         current_pnl = 0.0
         pnl_percent = 0.0
+        
         if self.initial_real_equity > 0:
             current_pnl = self.real_equity - self.initial_real_equity
             pnl_percent = (current_pnl / self.initial_real_equity) * 100
+
+        # === [新增] 磨损率计算 ===
+        wear_rate = 0.0
+        if self.stats['total_quote_vol'] > 0:
+            # 磨损率 = (净盈亏 / 总成交额) * 100%
+            wear_rate = (current_pnl / self.stats['total_quote_vol']) * 100
 
         beijing_now = datetime.utcnow() + timedelta(hours=8)
         time_str = beijing_now.strftime('%H:%M:%S')
 
         msg = (
-            f"\n{'='*3} 📊 策略运行汇总 {'='*3}\n"
+            f"\n{'='*3} 📊 策略运行汇总 ({time_str}) {'='*3}\n"
             f"模式: {self.symbol} | {self.mode}\n"
-            f"初始: {self.initial_real_equity:.2f}\n"
-            f"当前: {self.real_equity:.2f}\n"
+            f"初始: {self.initial_real_equity:.2f} | 当前: {self.real_equity:.2f}\n"
             f"持仓: {self.held_qty:.4f} (均价: {self.avg_cost:.4f})\n"
-            f"运行时间: {duration_str}\n"
             f"盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
-            f"成交: {self.stats['fill_count']}次 | 额: {self.stats['total_quote_vol']:.1f}\n"
+            f"成交: {self.stats['fill_count']}次 \n"
+            f"成交: {self.stats['total_quote_vol']:.1f} USDC\n"
+            f"磨损: {wear_rate:.5f}%\n"
+            f"运行时间: {duration_str}\n"
             f"{'='*5} {time_str} {'='*3}\n"
         )
         logger.info(msg)
