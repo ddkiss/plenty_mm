@@ -350,13 +350,13 @@ class DualMaker:
                 # 5. 执行逻辑
                 if not needs_rebalance:
                     # 静默待机
-                    time.sleep(0.5)
+                    time.sleep(1)
                     continue
                 
                 # --- 进入重置流程 (Cancel -> Sync -> Place) ---
                 
                 self.cancel_all()     
-                time.sleep(0.8)       
+                time.sleep(1)       
                 self._sync_clean_state() 
                 
                 if trade_happened:
