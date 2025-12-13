@@ -223,20 +223,18 @@ class DualMaker:
         
         current_pnl = 0.0
         pnl_percent = 0.0
-        
         if self.initial_real_equity > 0:
             current_pnl = self.real_equity - self.initial_real_equity
             pnl_percent = (current_pnl / self.initial_real_equity) * 100
 
-        # === [新增] 磨损率计算 ===
         wear_rate = 0.0
         if self.stats['total_quote_vol'] > 0:
-            # 磨损率 = (净盈亏 / 总成交额) * 100%
             wear_rate = (current_pnl / self.stats['total_quote_vol']) * 100
 
         beijing_now = datetime.utcnow() + timedelta(hours=8)
         time_str = beijing_now.strftime('%H:%M:%S')
 
+        # [Custom] 用户定制的汇总格式
         msg = (
             f"\n{'='*3} 📊 策略运行汇总 ({time_str}) {'='*3}\n"
             f"模式: {self.symbol} | {self.mode}\n"
@@ -304,7 +302,7 @@ class DualMaker:
             depth = self.rest.get_depth(self.symbol, limit=1)
             if depth: self.avg_cost = float(depth['bids'][0][0])
 
-        logger.info("🚀 策略已启动 (Clean-Calculate-Place 模式)")
+        logger.info("🚀 策略已启动 (Smart Rebalance 模式)")
 
         while True:
             try:
