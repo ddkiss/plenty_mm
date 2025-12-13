@@ -28,7 +28,7 @@ class DualMaker:
         self.held_qty = 0.0
         self.avg_cost = 0.0
         
-        # === [核心修改] 区分 "交易净值" 和 "真实净值" ===
+        # === 区分 "交易净值" 和 "真实净值" ===
         self.equity = 0.0       # netEquity (含折扣，用于下单风控)
         self.real_equity = 0.0  # Real Value (无折扣，用于计算真实盈亏)
         
@@ -78,9 +78,8 @@ class DualMaker:
     def _sync_state(self):
         """
         同步状态核心 (Unified Margin):
-        1. 获取 MarginAccountSummary 对象。
-        2. 提取 netEquity 用于交易风控 (Risk-Adjusted)。
-        3. 提取 assetsValue, borrowLiability, pnlUnrealized 计算真实净值 (No Haircut)。
+        1. 获取 netEquity 用于交易风控 (Risk-Adjusted)。
+        2. 遍历 collateral 累加 balanceNotional 计算真实净值 (No Haircut)。
         """
         try:
             # --- 1. 获取联合保证金账户数据 ---
@@ -94,54 +93,58 @@ class DualMaker:
             self.equity = float(col.get("netEquity", 0))
 
             # B. 计算真实净值 (无折扣) - 用于显示盈亏
-            # 严格使用 MarginAccountSummary 字段，不进行手动计算
-            assets_val = float(col.get("assetsValue", 0))       # 现货资产名义价值 (正值)
-            borrow_liab = float(col.get("borrowLiability", 0)) # 借贷名义价值 (正值，代表负债)
-            unrealized = float(col.get("pnlUnrealized", 0))    # 合约未实现盈亏 (可正可负)
+            # 必须使用 collateral[].balanceNotional (Index Price * Balance)
+            # 而不是 assetsValue (Index Price * Balance * Weight)
             
-            # Real Equity = 资产总值 - 负债总值 + 未实现盈亏
-            self.real_equity = assets_val - borrow_liab + unrealized
+            collateral_list = col.get("collateral", [])
+            total_assets_notional = 0.0
+            
+            base_asset = self.symbol.split('_')[0] 
+            found_asset = False
 
-            # 记录初始资金 (只记录一次，且必须大于0)
-            if self.initial_real_equity == 0 and self.real_equity > 0:
-                self.initial_real_equity = self.real_equity
-                logger.info(f"💰 初始真实本金记录: {self.initial_real_equity:.2f} USDC (无折扣市值)")
+            for asset in collateral_list:
+                # 累加每个资产的真实名义价值
+                # API文档: balanceNotional = Balance of spot instrument in USDC
+                total_assets_notional += float(asset.get("balanceNotional", 0))
+                
+                # 顺便获取当前交易对的持仓
+                if asset.get("symbol") == base_asset:
+                    self.held_qty = float(asset.get("totalQuantity", 0))
+                    found_asset = True
 
-            # --- 2. 获取持仓数量 (Held Qty) ---
+            borrow_liab = float(col.get("borrowLiability", 0)) # 借贷名义价值
+            unrealized = float(col.get("pnlUnrealized", 0))    # 合约未实现盈亏
+            
+            # Real Equity = 真实资产总值 - 负债总值 + 未实现盈亏
+            self.real_equity = total_assets_notional - borrow_liab + unrealized
+
+            # 如果没找到持仓，置0
+            if not found_asset and not self.is_perp:
+                self.held_qty = 0.0
+            
+            # 合约持仓单独获取 (因为 collateral 里主要放现货资产)
             if self.is_perp:
-                # === 合约模式 ===
                 positions = self.rest.get_positions(self.symbol)
-                pos_found = False
+                found_pos = False
                 if isinstance(positions, list):
                     for p in positions:
                         if p.get('symbol') == self.symbol:
                             self.held_qty = float(p.get('netQuantity', 0))
                             self.avg_cost = float(p.get('entryPrice', 0))
-                            pos_found = True
+                            found_pos = True
                             break
-                if not pos_found:
+                if not found_pos:
                     self.held_qty = 0.0
                     self.avg_cost = 0.0
             else:
-                # === 现货模式 (Unified) ===
-                collateral_list = col.get("collateral", [])
-                base_asset = self.symbol.split('_')[0] 
-                
-                found_asset = False
-                for asset in collateral_list:
-                    if asset.get("symbol") == base_asset:
-                        # 现货持仓 = totalQuantity (API文档显示这是未打折的总量)
-                        # totalQuantity = available + locked + staked
-                        self.held_qty = float(asset.get("totalQuantity", 0))
-                        found_asset = True
-                        break
-                
-                if not found_asset:
-                    self.held_qty = 0.0
-                
                 # 现货成本估算
                 if self.avg_cost == 0 and self.active_buy_price > 0:
                     self.avg_cost = self.active_buy_price
+
+            # 记录初始资金 (只记录一次，且必须大于0)
+            if self.initial_real_equity == 0 and self.real_equity > 0:
+                self.initial_real_equity = self.real_equity
+                logger.info(f"💰 初始真实本金记录: {self.initial_real_equity:.2f} USDC (无折扣市值)")
 
             # --- 3. 反推订单状态 ---
             open_orders = self.rest.get_open_orders(self.symbol)
@@ -206,18 +209,18 @@ class DualMaker:
             time_str = beijing_now.strftime('%H:%M:%S')
 
             msg = (
-                f"\n{'='*3} 📊 策略运行汇总 \n"
+                f"\n{'='*3} 📊 策略运行汇总 {'='*3}\n"
                 f"模式: {self.symbol} (Unified) | {self.mode}\n"
                 f"初始本金: {self.initial_real_equity:.2f} USDC\n"
                 f"真实净值: {self.real_equity:.2f} USDC (准确盈亏)\n"
                 f"交易净值: {self.equity:.2f} USDC (风控/下单)\n"
                 f"累计盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
                 f"-------\n"
-                f"累计运行:   {duration_str}\n"
+                f"累计运行: {duration_str}\n"
                 f"成交次数: {self.stats['fill_count']} 次\n"
                 f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"             
                 f"资金磨损: {wear_rate:.4f}%\n"
-                f"{'='*5} ({time_str}) {'='*3}\n "
+                f"{'='*5}  {time_str}  {'='*3} \n "
             )
             logger.info(msg)
         except Exception as e:
