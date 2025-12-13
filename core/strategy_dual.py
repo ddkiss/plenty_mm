@@ -358,19 +358,64 @@ class DualMaker:
     def _logic_unwind(self, best_bid, best_ask):
         """回本模式"""
         timeout = (time.time() - self.unwind_start_time > self.cfg.BREAKEVEN_TIMEOUT)
-        unknown_cost = (self.avg_cost <= 0)
+        
+        # === 计算基于总净值的回本价格 (Unified) ===
+        # 目标: 平仓后 Equity >= Initial Equity
+        mid_price = (best_bid + best_ask) / 2
+        break_even_price = 0.0
+        use_be_price = False
+
+        if self.initial_equity > 0 and abs(self.held_qty) > self.min_qty:
+            try:
+                # 估算除去当前持仓后的剩余净值 (假设当前持仓价值被剥离)
+                current_pos_value = self.held_qty * mid_price
+                estimated_balance = self.equity - current_pos_value
+                
+                if self.held_qty > 0: # 多头
+                    # 卖出得到的钱 + 余额 >= 初始净值
+                    # Q * P * (1-fee) + Balance = Init
+                    # P = (Init - Balance) / (Q * (1-fee))
+                    numerator = self.initial_equity - estimated_balance
+                    denominator = self.held_qty * (1 - self.cfg.TAKER_FEE_RATE)
+                    if denominator != 0:
+                        break_even_price = numerator / denominator
+                        use_be_price = True
+                else: # 空头
+                    # 买入花费的钱，使得剩余余额 >= 初始净值
+                    # Balance - Q_buy * P * (1+fee) = Init
+                    # Q_buy * P * (1+fee) = Balance - Init
+                    # P = (Balance - Init) / (abs(Q) * (1+fee))
+                    numerator = estimated_balance - self.initial_equity
+                    denominator = abs(self.held_qty) * (1 + self.cfg.TAKER_FEE_RATE)
+                    if denominator != 0:
+                        break_even_price = numerator / denominator
+                        use_be_price = True
+                
+                if use_be_price:
+                    logger.info(f"🧐 回本计算: 净值{self.equity:.2f} 初始{self.initial_equity:.2f} 持仓{self.held_qty:.4f} -> 目标价 {break_even_price:.4f}")
+
+            except Exception as e:
+                logger.error(f"Calc BE Price Error: {e}")
 
         # A: 多头平仓 (手里有币，要卖)
         if self.held_qty >= self.min_qty:
             if self.active_buy_id: self.cancel_all()
             
-            if self.active_sell_id and (timeout or unknown_cost):
-                if abs(self.active_sell_price - best_ask) > self.tick_size / 2:
+            # 价格策略: 如果有回本价，取 max(回本价, 市场价)；否则 fallback 到市场价或原成本价
+            target = best_ask
+            if not timeout:
+                if use_be_price and break_even_price > 0:
+                    target = max(break_even_price, best_ask)
+                elif self.avg_cost > 0:
+                    target = max(self.avg_cost + self.tick_size, best_ask)
+
+            if self.active_sell_id:
+                # 如果价格偏离过大则撤单重挂
+                if abs(self.active_sell_price - target) > self.tick_size: # 稍微放宽一点检查阈值
                     self.cancel_all()
-                    return 
+                    return
 
             if not self.active_sell_id:
-                target = best_ask if (timeout or unknown_cost) else max(self.avg_cost + self.tick_size, best_ask)
                 qty = abs(self.held_qty)
                 self.active_sell_id = self._place("Ask", target, qty)
                 if self.active_sell_id:
@@ -378,19 +423,22 @@ class DualMaker:
                     self.active_sell_qty = qty
 
         # B: 空头平仓 (手里欠币，要买)
-        # 这里的判断 abs(held_qty) 兼容了现货借币卖出的情况(可能是负数也可能是借贷记录)
-        # Unified 模式下，净空头通常表现为负数 netQuantity (Perp) 或 负数 assets (Spot Margin?) 
-        # 我们这里主要处理 Perp 风格的负数持仓
         elif self.held_qty <= -self.min_qty:
             if self.active_sell_id: self.cancel_all()
             
-            if self.active_buy_id and (timeout or unknown_cost):
-                if abs(self.active_buy_price - best_bid) > self.tick_size / 2:
+            target = best_bid
+            if not timeout:
+                if use_be_price and break_even_price > 0:
+                    target = min(break_even_price, best_bid)
+                elif self.avg_cost > 0:
+                    target = min(self.avg_cost - self.tick_size, best_bid)
+
+            if self.active_buy_id:
+                if abs(self.active_buy_price - target) > self.tick_size:
                     self.cancel_all()
                     return
 
             if not self.active_buy_id:
-                target = best_bid if (timeout or unknown_cost) else min(self.avg_cost - self.tick_size, best_bid)
                 qty = abs(self.held_qty)
                 self.active_buy_id = self._place("Bid", target, qty)
                 if self.active_buy_id:
