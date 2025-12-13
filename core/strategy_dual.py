@@ -204,7 +204,7 @@ class DualMaker:
                 f"成交次数: {self.stats['fill_count']} 次\n"
                 f"总成交额: {self.stats['total_quote_vol']:.2f} USDC\n"             
                 f"资金磨损: {wear_rate:.4f}%\n"
-                f"{'='*5} 当前时间:{time_str} **\n "
+                f"{'='*5} 当前时间:{time_str} ==\n "
             )
             logger.info(msg)
         except Exception as e:
