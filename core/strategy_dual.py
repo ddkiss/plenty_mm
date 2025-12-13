@@ -108,7 +108,7 @@ class DualMaker:
                             self.avg_cost = fill_price
 
                     self._update_stats("Buy", self.active_buy_price, self.active_buy_qty)
-                    self.active_buy_id = None # 标记为空，防止重复统计
+                    self.active_buy_id = None 
             
             # 2. 检查卖单
             if self.active_sell_id:
@@ -236,7 +236,7 @@ class DualMaker:
             f"当前: {self.real_equity:.2f}\n"
             f"持仓: {self.held_qty:.4f} (均价: {self.avg_cost:.4f})\n"
             f"盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
-            f"🌟🌟 \n"
+            f"\n 🌟🌟 \n"
             f"成交: {self.stats['fill_count']}次 \n"
             f"成交: {self.stats['total_quote_vol']:.1f} USDC\n"
             f"磨损: {wear_rate:.5f}%\n"
@@ -248,7 +248,6 @@ class DualMaker:
     def cancel_all(self):
         try:
             self.rest.cancel_open_orders(self.symbol)
-            # 撤单后清空本地记录，确保下次状态纯净
             self.active_buy_id = None
             self.active_sell_id = None
         except Exception as e:
@@ -277,7 +276,6 @@ class DualMaker:
                 return res["id"]
             else:
                 msg = res.get("message", str(res))
-                # 忽略一些常见错误
                 if "insufficient" not in msg.lower():
                     logger.warning(f"⚠️ 下单失败: {msg}")
                 return None
@@ -285,7 +283,7 @@ class DualMaker:
             return None
 
     # ============================================================
-    # 主循环逻辑 (优化版: 动静结合)
+    # 主循环逻辑
     # ============================================================
     def run(self):
         self.init_market_info()
@@ -324,44 +322,52 @@ class DualMaker:
                 # 4. 决策: 是否需要重置订单? (Rebalance Check)
                 needs_rebalance = False
                 
-                # 条件A: 发生成交 -> 必须重置以更新仓位
+                # A: 发生成交 -> 必须重置
                 if trade_happened:
                     needs_rebalance = True
                 
-                # 条件B: 当前无挂单 (但应该有) -> 必须挂单
-                # 注意: 如果是 DUAL 模式，应该双边都有；如果是 UNWIND，至少有一边
+                # B: 挂单缺失 -> 必须补单
                 elif self.mode == "DUAL" and (not self.active_buy_id or not self.active_sell_id):
                     needs_rebalance = True
+                elif self.mode == "UNWIND" and (not self.active_buy_id and not self.active_sell_id):
+                    # Unwind 模式下至少要有一个反向单
+                    needs_rebalance = True
                 
-                # 条件C: 价格偏离 (Price Drift) -> 需要追单
-                # 如果当前挂单价格 与 市场最优价 偏差超过 1.5个 Tick，则重置
+                # C: 价格偏离 (Price Drift)
+                # === [修改点] UNWIND 模式下，除非超时，否则忽略价格偏离，避免反复撤单 ===
                 else:
-                    if self.active_buy_id and abs(self.active_buy_price - bid_1) > self.tick_size * 1.5:
-                        needs_rebalance = True
-                    if self.active_sell_id and abs(self.active_sell_price - ask_1) > self.tick_size * 1.5:
-                        needs_rebalance = True
+                    is_timeout = False
+                    if self.mode == "UNWIND":
+                        is_timeout = (time.time() - self.unwind_start_time > self.cfg.BREAKEVEN_TIMEOUT)
+                    
+                    # 只有在 DUAL 模式 或 UNWIND超时(追单) 模式下，才检查盘口偏离
+                    if self.mode == "DUAL" or (self.mode == "UNWIND" and is_timeout):
+                        if self.active_buy_id and abs(self.active_buy_price - bid_1) > self.tick_size * 3:
+                            needs_rebalance = True
+                        if self.active_sell_id and abs(self.active_sell_price - ask_1) > self.tick_size * 3:
+                            needs_rebalance = True
 
                 # 5. 执行逻辑
                 if not needs_rebalance:
-                    # 如果不需要重置，就静默待机
+                    # 静默待机
                     time.sleep(0.5)
                     continue
                 
                 # --- 进入重置流程 (Cancel -> Sync -> Place) ---
                 
-                self.cancel_all()     # 1. 强制清场
-                time.sleep(0.8)       # 2. 等待结算
-                self._sync_clean_state() # 3. 获取纯净状态
+                self.cancel_all()     
+                time.sleep(0.8)       
+                self._sync_clean_state() 
                 
-                # 仅在有成交触发时打印汇总
                 if trade_happened:
                     self._print_stats()
 
-                # 风控检查 (Position Control)
+                # 风控检查
                 mid_price = (bid_1 + ask_1) / 2
                 exposure = abs(self.held_qty * mid_price)
                 effective_capital = self.equity * self.cfg.LEVERAGE 
                 if effective_capital <= 0: effective_capital = 1
+                
                 ratio = exposure / effective_capital
                 
                 if ratio > self.cfg.MAX_POSITION_PCT:
@@ -369,7 +375,7 @@ class DualMaker:
                         logger.warning(f"⚠️ 仓位过重 ({ratio:.1%}) -> 切换 UNWIND")
                         self.mode = "UNWIND"
                         self.unwind_start_time = time.time()
-                elif abs(self.held_qty) <= self.min_qty and self.mode == "UNWIND":
+                elif abs(self.held_qty) < self.min_qty and self.mode == "UNWIND":
                     logger.info("🎉 仓位回归 -> 切换 DUAL")
                     self.mode = "DUAL"
 
@@ -379,7 +385,6 @@ class DualMaker:
                 else:
                     self._logic_unwind(bid_1, ask_1)
 
-                # 挂单后短暂等待
                 time.sleep(self.cfg.REBALANCE_WAIT)
 
             except Exception as e:
@@ -387,7 +392,6 @@ class DualMaker:
                 time.sleep(1)
 
     def _logic_dual(self, target_bid, target_ask):
-        # 重新挂单，无需检查旧单（已被撤销）
         raw_qty = (self.equity * self.cfg.LEVERAGE * self.cfg.GRID_ORDER_PCT) / target_ask
         if raw_qty < self.min_qty: return 
         if target_bid >= target_ask: return 
