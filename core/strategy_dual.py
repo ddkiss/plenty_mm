@@ -72,9 +72,15 @@ class DualMaker:
     # 阶段 1: 检查上一轮订单 (在撤单前执行)
     # ============================================================
     def _check_previous_orders(self):
-        """检查上一轮挂单是否成交"""
+        """
+        检查上一轮挂单是否成交
+        Returns:
+            bool: True if trade occurred, False otherwise
+        """
+        trade_occurred = False
+        
         if not self.active_buy_id and not self.active_sell_id:
-            return
+            return False
 
         try:
             # 获取当前挂单列表
@@ -89,15 +95,14 @@ class DualMaker:
                 if str(self.active_buy_id) not in active_ids:
                     # 订单消失，视为成交 (简化逻辑)
                     logger.info(f"🔔 买单已成交 (ID: {self.active_buy_id})")
+                    trade_occurred = True
                     
                     # 现货成本更新 (加权平均)
-                    # 注意: 此时还没有 sync 最新的 held_qty，所以我们基于上一轮数据估算
                     if not self.is_perp:
                         prev_qty = max(0, self.held_qty) # 上一轮的持仓
                         fill_qty = self.active_buy_qty
                         fill_price = self.active_buy_price
                         
-                        # 新的总价值 / 新的总数量
                         total_qty = prev_qty + fill_qty
                         if total_qty > 0:
                             new_avg = ((prev_qty * self.avg_cost) + (fill_qty * fill_price)) / total_qty
@@ -112,14 +117,16 @@ class DualMaker:
             if self.active_sell_id:
                 if str(self.active_sell_id) not in active_ids:
                     logger.info(f"🔔 卖单已成交 (ID: {self.active_sell_id})")
+                    trade_occurred = True
                     self._update_stats("Sell", self.active_sell_price, self.active_sell_qty)
 
         except Exception as e:
             logger.error(f"Check Order Error: {e}")
         finally:
-            # 无论如何，检查完后重置本地ID，等待下一轮重新挂单
             self.active_buy_id = None
             self.active_sell_id = None
+            
+        return trade_occurred
 
     # ============================================================
     # 阶段 2: 同步账户数据 (在撤单后执行，确保干净)
@@ -211,7 +218,9 @@ class DualMaker:
 
     def _print_stats(self):
         now = time.time()
-        duration_str = str(timedelta(seconds=int(now - self.start_time)))
+        # 计算总运行时间
+        duration = now - self.start_time
+        duration_str = str(timedelta(seconds=int(duration)))
         
         current_pnl = 0.0
         pnl_percent = 0.0
@@ -223,13 +232,15 @@ class DualMaker:
         time_str = beijing_now.strftime('%H:%M:%S')
 
         msg = (
-            f"\n{'='*3} 📊 策略运行汇总 ({time_str}) {'='*3}\n"
+            f"\n{'='*3} 📊 策略运行汇总 {'='*3}\n"
             f"模式: {self.symbol} | {self.mode}\n"
-            f"初始: {self.initial_real_equity:.2f} | 当前: {self.real_equity:.2f}\n"
+            f"初始: {self.initial_real_equity:.2f}\n"
+            f"当前: {self.real_equity:.2f}\n"
             f"持仓: {self.held_qty:.4f} (均价: {self.avg_cost:.4f})\n"
+            f"运行时间: {duration_str}\n"
             f"盈亏: {current_pnl:+.4f} USDC ({pnl_percent:+.2f}%)\n"
             f"成交: {self.stats['fill_count']}次 | 额: {self.stats['total_quote_vol']:.1f}\n"
-            f"{'='*25}\n"
+            f"{'='*5} {time_str} {'='*3}\n"
         )
         logger.info(msg)
 
@@ -289,18 +300,21 @@ class DualMaker:
         while True:
             try:
                 # 1. 检查上一轮成交 (Order Check)
-                self._check_previous_orders()
+                # 返回 True 表示有成交
+                trade_happened = self._check_previous_orders()
 
                 # 2. 强制清场 (Cancel) - 确保计算时无挂单/无预借
                 self.cancel_all()
                 
                 # 3. 等待交易所状态回正 (Sleep)
-                # 这一点至关重要，API更新有延迟，特别是 borrowedQuantity
                 time.sleep(0.8) 
 
                 # 4. 获取纯净状态 (Sync)
                 self._sync_clean_state()
-                self._print_stats()
+                
+                # 只有发生交易时才打印汇总
+                if trade_happened:
+                    self._print_stats()
 
                 # 5. 获取行情
                 depth = self.rest.get_depth(self.symbol, limit=5)
@@ -334,7 +348,6 @@ class DualMaker:
                     self._logic_unwind(bid_1, ask_1)
 
                 # 8. 挂单持续时间 (Wait)
-                # 这段时间是留给订单成交的窗口
                 time.sleep(self.cfg.REBALANCE_WAIT)
 
             except Exception as e:
