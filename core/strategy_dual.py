@@ -115,6 +115,26 @@ class DualMaker:
                 if str(self.active_sell_id) not in active_ids:
                     logger.info(f"🔔 卖单已成交 (ID: {self.active_sell_id})")
                     trade_occurred = True
+                    # === [新增修复] 现货做空成本更新逻辑 ===
+                    if not self.is_perp:
+                        # 逻辑：
+                        # 1. 如果当前持有空单 (held_qty <= 0)，卖出等于加仓空头，需要更新加权平均成本。
+                        # 2. 如果当前持有多单 (held_qty > 0)，卖出等于减仓/止盈，成本(Entry Price)通常不变。
+                        if self.held_qty <= 0:
+                            prev_abs_qty = abs(self.held_qty)
+                            fill_qty = self.active_sell_qty
+                            fill_price = self.active_sell_price
+                            
+                            total_qty = prev_abs_qty + fill_qty
+                            
+                            if total_qty > 0:
+                                # 计算加权平均：(旧持仓量*旧成本 + 新成交量*新价格) / 总量
+                                new_avg = ((prev_abs_qty * self.avg_cost) + (fill_qty * fill_price)) / total_qty
+                                logger.info(f"📊 (Short)成本更新: {self.avg_cost:.4f} -> {new_avg:.4f}")
+                                self.avg_cost = new_avg
+                            else:
+                                self.avg_cost = fill_price
+                    # ==========================================
                     self._update_stats("Sell", self.active_sell_price, self.active_sell_qty)
                     self.active_sell_id = None
 
