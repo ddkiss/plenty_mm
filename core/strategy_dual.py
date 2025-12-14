@@ -411,48 +411,61 @@ class DualMaker:
             logger.info(f"✅ DUAL: 买{target_bid} | 卖{target_ask} (Qty: {raw_qty:.2f})")
 
     def _logic_unwind(self, best_bid, best_ask):
-        deficit = max(0.0, self.initial_real_equity - self.real_equity)
+        """
+        简化后的 Unwind 逻辑：
+        1. 优先尝试在成本价上方平仓。
+        2. 如果超时，则直接跟随盘口平仓 (Maker 模式)。
+        """
         duration = time.time() - self.unwind_start_time
         is_timeout = duration > self.cfg.BREAKEVEN_TIMEOUT
         
-        mid_price = (best_bid + best_ask) / 2
         qty_abs = abs(self.held_qty)
-        
-        markup_per_unit = 0.0
-        if qty_abs > self.min_qty:
-            markup_per_unit = deficit / qty_abs
-        
-        # A: 多头平仓
-        if self.held_qty >= self.min_qty:
-            target = mid_price + markup_per_unit
+        if qty_abs < self.min_qty: return
+
+        # === 多头平仓 (卖出) ===
+        if self.held_qty > 0:
+            # 默认目标：成本价微利 (1.0005 是 0.05% 的利润缓冲，覆盖手续费)
+            target_price = self.avg_cost * 1.0005
+            
+            # 限制：不能低于当前买一价 (防止直接 Taker 砸盘，虽然 API 也会拦截)
+            # 同时也别偏离卖一价太远，否则挂太高卖不掉
             
             if is_timeout:
-                decay = min(1.0, (duration - self.cfg.BREAKEVEN_TIMEOUT) / 600)
-                target = target * (1 - decay) + best_ask * decay
-                if decay > 0.1: logger.warning(f"⏰ Unwind衰减: {target:.4f}")
+                # 🚨 超时模式：不管成本了，直接挂在 卖一 (Best Ask) 
+                # 含义：我现在就要走，只要有人买我就卖
+                final_price = best_ask
+                logger.warning(f"⏰ Unwind超时，强制跟随盘口: {final_price}")
+            else:
+                # 🛡️ 保本模式：
+                # 挂单价 = max(盘口价, 成本价)
+                # 如果现在的卖一价(101) > 成本(100)，那就挂 101 多赚点
+                # 如果现在的卖一价(99) < 成本(100)，那就挂 100 等回来
+                final_price = max(best_ask, target_price)
 
-            final_price = max(target, best_ask)
-            
-            logger.info(f"🛡️ Unwind(Long): 目标{final_price:.3f} (Deficit: {deficit:.2f})")
+            # 执行挂单
             self.active_sell_id = self._place("Ask", final_price, qty_abs)
             if self.active_sell_id:
                 self.active_sell_price = final_price
                 self.active_sell_qty = qty_abs
+                logger.info(f"🛡️ Unwind(Long): 挂卖{final_price:.2f} (成本{self.avg_cost:.2f})")
 
-        # B: 空头平仓
-        elif self.held_qty <= -self.min_qty:
-            target = mid_price - markup_per_unit
-            if target <= 0: target = best_bid * 0.5
+        # === 空头平仓 (买入) ===
+        elif self.held_qty < 0:
+            # 默认目标：成本价微利
+            target_price = self.avg_cost * (1 - 0.0005)
             
             if is_timeout:
-                decay = min(1.0, (duration - self.cfg.BREAKEVEN_TIMEOUT) / 600)
-                target = target * (1 - decay) + best_bid * decay
-                if decay > 0.1: logger.warning(f"⏰ Unwind衰减: {target:.4f}")
+                # 🚨 超时模式：直接挂在 买一 (Best Bid)
+                final_price = best_bid
+                logger.warning(f"⏰ Unwind超时，强制跟随盘口: {final_price}")
+            else:
+                # 🛡️ 保本模式：
+                # 挂单价 = min(盘口价, 成本价)
+                final_price = min(best_bid, target_price)
 
-            final_price = min(target, best_bid)
-            
-            logger.info(f"🛡️ Unwind(Short): 目标{final_price:.3f} (Deficit: {deficit:.2f})")
+            # 执行挂单
             self.active_buy_id = self._place("Bid", final_price, qty_abs)
             if self.active_buy_id:
                 self.active_buy_price = final_price
                 self.active_buy_qty = qty_abs
+                logger.info(f"🛡️ Unwind(Short): 挂买{final_price:.2f} (成本{self.avg_cost:.2f})")
