@@ -445,7 +445,7 @@ class DualMaker:
         # === 多头平仓 (卖出) ===
         if self.held_qty > 0:
             # 默认目标：成本价微利 (1.0005 是 0.05% 的利润缓冲，覆盖手续费)
-            target_price = self.avg_cost * 1.0005
+            target_price = self.avg_cost * 1.00015
             
             # 限制：不能低于当前买一价 (防止直接 Taker 砸盘，虽然 API 也会拦截)
             # 同时也别偏离卖一价太远，否则挂太高卖不掉
@@ -472,7 +472,7 @@ class DualMaker:
         # === 空头平仓 (买入) ===
         elif self.held_qty < 0:
             # 默认目标：成本价微利
-            target_price = self.avg_cost * (1 - 0.0005)
+            target_price = self.avg_cost * (1 - 0.00015)
             
             if is_timeout:
                 # 🚨 超时模式：直接挂在 买一 (Best Bid)
