@@ -369,7 +369,7 @@ class DualMaker:
                 # 5. 执行逻辑
                 if not needs_rebalance:
                     # 静默待机
-                    time.sleep(2)
+                    time.sleep(0.5)
                     continue
                 
                 # --- 进入重置流程 (Cancel -> Sync -> Place) ---
