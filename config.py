@@ -34,7 +34,7 @@ class Config:
     MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.45"))
     
     # 成交后的冷却时间 (秒)
-    REBALANCE_WAIT = int(os.getenv("REBALANCE_WAIT", "2"))
+    REBALANCE_WAIT = float(os.getenv("REBALANCE_WAIT", "2"))
     
     # 回本单超时时间 (秒)，超过后强制止损
     BREAKEVEN_TIMEOUT = int(os.getenv("BREAKEVEN_TIMEOUT", "1200"))
