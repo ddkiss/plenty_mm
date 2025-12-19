@@ -444,7 +444,7 @@ class DualMaker:
 
         # === 多头平仓 (卖出) ===
         if self.held_qty > 0:
-            target_price = self.avg_cost * 1.00015
+            target_price = self.avg_cost * 1.0001
             
             # 默认为 Maker
             use_post_only = True
@@ -471,7 +471,7 @@ class DualMaker:
 
         # === 空头平仓 (买入) ===
         elif self.held_qty < 0:
-            target_price = self.avg_cost * (1 - 0.00015)
+            target_price = self.avg_cost * (1 - 0.0001)
             
             use_post_only = True
 
