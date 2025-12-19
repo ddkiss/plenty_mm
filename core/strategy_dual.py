@@ -272,7 +272,7 @@ class DualMaker:
         except Exception as e:
             logger.error(f"Cancel Error: {e}")
 
-    def _place(self, side, price, qty):
+    def _place(self, side, price, qty, post_only=True): 
         price = round_to_step(price, self.tick_size)
         qty = floor_to(qty, self.base_precision)
         if qty < self.min_qty: return None
@@ -284,7 +284,8 @@ class DualMaker:
                 "orderType": "Limit",
                 "price": str(price),
                 "quantity": str(qty),
-                "postOnly": True 
+                # 修改这里：使用传入的参数
+                "postOnly": post_only 
             }
             if not self.is_perp:
                 payload["autoBorrow"] = True
@@ -415,8 +416,8 @@ class DualMaker:
         if raw_qty < self.min_qty: return 
         if target_bid >= target_ask: return 
         
-        buy_id = self._place("Bid", target_bid, raw_qty)
-        sell_id = self._place("Ask", target_ask, raw_qty)
+        buy_id = self._place("Bid", target_bid, raw_qty, post_only=True)
+        sell_id = self._place("Ask", target_ask, raw_qty, post_only=True)
         
         if buy_id:
             self.active_buy_id = buy_id
@@ -431,61 +432,64 @@ class DualMaker:
             logger.info(f"✅ DUAL: 买{target_bid} | 卖{target_ask} (Qty: {raw_qty:.2f})")
 
     def _logic_unwind(self, best_bid, best_ask):
-        """
-        简化后的 Unwind 逻辑：
-        1. 优先尝试在成本价上方平仓。
-        2. 如果超时，则直接跟随盘口平仓 (Maker 模式)。
-        """
         duration = time.time() - self.unwind_start_time
         is_timeout = duration > self.cfg.BREAKEVEN_TIMEOUT
         
         qty_abs = abs(self.held_qty)
         if qty_abs < self.min_qty: return
 
+        # 定义一个滑点容忍度（例如 0.5%），确保能吃掉深度
+        # 如果是百倍杠杆或者极速行情，这个值可以适当加大
+        taker_buffer = 0.005 
+
         # === 多头平仓 (卖出) ===
         if self.held_qty > 0:
-            # 默认目标：成本价微利 (1.0005 是 0.05% 的利润缓冲，覆盖手续费)
             target_price = self.avg_cost * 1.00015
             
-            # 限制：不能低于当前买一价 (防止直接 Taker 砸盘，虽然 API 也会拦截)
-            # 同时也别偏离卖一价太远，否则挂太高卖不掉
+            # 默认为 Maker
+            use_post_only = True
             
             if is_timeout:
-                # 🚨 超时模式：不管成本了，直接挂在 卖一 (Best Ask) 
-                # 含义：我现在就要走，只要有人买我就卖
-                final_price = best_ask
-                logger.warning(f"⏰ Unwind超时，强制跟随盘口: {final_price}")
+                # 🚨【改进】超时模式：转为 Taker
+                # 逻辑：直接卖给买一 (Best Bid)，并稍微调低价格以防滑点（Limit Taker）
+                final_price = best_bid * (1 - taker_buffer) 
+                use_post_only = False # 允许吃单
+                logger.warning(f"⏰ Unwind超时，执行 Taker 强平: 价格 {final_price:.2f} (买一 {best_bid})")
             else:
-                # 🛡️ 保本模式：
-                # 挂单价 = max(盘口价, 成本价)
-                # 如果现在的卖一价(101) > 成本(100)，那就挂 101 多赚点
-                # 如果现在的卖一价(99) < 成本(100)，那就挂 100 等回来
+                # 🛡️ 正常 Maker 模式
                 final_price = max(best_ask, target_price)
 
-            # 执行挂单
-            self.active_sell_id = self._place("Ask", final_price, qty_abs)
+            # 执行挂单，传入 post_only 参数
+            self.active_sell_id = self._place("Ask", final_price, qty_abs, post_only=use_post_only)
+            
             if self.active_sell_id:
                 self.active_sell_price = final_price
                 self.active_sell_qty = qty_abs
-                logger.info(f"🛡️ Unwind(Long): 挂卖{final_price:.2f} (成本{self.avg_cost:.2f})")
+                # 日志区分 Taker/Maker
+                log_type = "Taker⚡" if not use_post_only else "Maker🛡️"
+                logger.info(f"{log_type} Unwind(Long): 挂卖{final_price:.2f} (成本{self.avg_cost:.2f})")
 
         # === 空头平仓 (买入) ===
         elif self.held_qty < 0:
-            # 默认目标：成本价微利
             target_price = self.avg_cost * (1 - 0.00015)
             
+            use_post_only = True
+
             if is_timeout:
-                # 🚨 超时模式：直接挂在 买一 (Best Bid)
-                final_price = best_bid
-                logger.warning(f"⏰ Unwind超时，强制跟随盘口: {final_price}")
+                # 🚨【改进】超时模式：转为 Taker
+                # 逻辑：直接买入卖一 (Best Ask)，并稍微调高价格以防滑点
+                final_price = best_ask * (1 + taker_buffer)
+                use_post_only = False # 允许吃单
+                logger.warning(f"⏰ Unwind超时，执行 Taker 强平: 价格 {final_price:.2f} (卖一 {best_ask})")
             else:
-                # 🛡️ 保本模式：
-                # 挂单价 = min(盘口价, 成本价)
+                # 🛡️ 正常 Maker 模式
                 final_price = min(best_bid, target_price)
 
             # 执行挂单
-            self.active_buy_id = self._place("Bid", final_price, qty_abs)
+            self.active_buy_id = self._place("Bid", final_price, qty_abs, post_only=use_post_only)
+            
             if self.active_buy_id:
                 self.active_buy_price = final_price
                 self.active_buy_qty = qty_abs
-                logger.info(f"🛡️ Unwind(Short): 挂买{final_price:.2f} (成本{self.avg_cost:.2f})")
+                log_type = "Taker⚡" if not use_post_only else "Maker🛡️"
+                logger.info(f"{log_type} Unwind(Short): 挂买{final_price:.2f} (成本{self.avg_cost:.2f})")
